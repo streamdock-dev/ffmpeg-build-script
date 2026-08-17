@@ -155,9 +155,31 @@ jobs:
         run: |
           ./build-ffmpeg --cleanup
 
+  # Fork-local addition: upstream ships as source only ("Releases are drafted
+  # and published by hand ... nothing has to be uploaded here", see
+  # release-version-check below) -- this fork also publishes the compiled
+  # macOS binaries as release assets, because that's the whole point of the
+  # fork: StreamDock's own CI curls prebuilt binaries for every other
+  # platform and has no macOS equivalent to point at (evermeet.cx is the
+  # only other macOS source and ships a GPL build; see
+  # docs/macos-lgpl-ffmpeg-build-plan.md in the StreamDock repo). Matrixed
+  # over both architectures GitHub still supports natively post the macOS-13
+  # retirement (Dec 2025): macos-15 for arm64, macos-15-intel for x86_64 (its
+  # replacement, available through Aug 2027) -- no cross-compiling either
+  # direction.
   build-macos:
-    name: build in native macOS
-    runs-on: macos-15
+    name: build in native macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -179,6 +201,24 @@ jobs:
       - name: test run ffmepg
         run: |
           ./workspace/bin/ffmpeg -buildconf
+
+      # Gated on tag push only, so ordinary branch/PR builds stay exactly as
+      # fast as upstream's -- no artifact is produced or uploaded for those.
+      # No GPL/LGPL distinction to make here: the build step above never
+      # passes --enable-gpl-and-non-free, so every artifact this job produces
+      # is LGPL-only (no libx264/libx265) by construction, same as this job's
+      # non-release runs always have been.
+      - name: package release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tar -cJf ffmpeg-macos-${{ matrix.arch }}-lgpl.tar.xz -C workspace/bin ffmpeg ffprobe
+
+      - name: upload release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ffmpeg-macos-${{ matrix.arch }}-lgpl.tar.xz
+
       - name: clean up
         run: |
           ./build-ffmpeg --cleanup
