@@ -69,10 +69,22 @@ build_gmp() {
         # rather than CFLAGS because GMP picks its own optimisation and ABI flags, and
         # setting CFLAGS discards that tuning.
         GMP_STD_FLAG="$(pre_c23_cflag)"
+        # GMP's hand-tuned x86_64 assembly (dive_1.o, mod_34lsub1.o, etc.) is
+        # position-dependent, and Xcode 16's linker now hard-rejects that as
+        # "Illegal text-relocations" -- confirmed on a real macos-15-intel
+        # GitHub Actions runner, not inferred. Apple Silicon is unaffected
+        # (different asm files; this chain is already verified working there,
+        # see build_gnutls's comment below), so this is scoped to Intel macOS
+        # only rather than paying the portable-C fallback's slowdown
+        # everywhere.
+        GMP_CONFIGURE_OPTIONS=(--prefix="${WORKSPACE}" --disable-shared --enable-static)
+        if [[ "$OSTYPE" == "darwin"* && -z "$MACOS_SILICON" ]]; then
+            GMP_CONFIGURE_OPTIONS+=(--disable-assembly)
+        fi
         if [ -n "$GMP_STD_FLAG" ]; then
-            execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static CC="${CC:-gcc}$GMP_STD_FLAG"
+            execute ./configure "${GMP_CONFIGURE_OPTIONS[@]}" CC="${CC:-gcc}$GMP_STD_FLAG"
         else
-            execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static
+            execute ./configure "${GMP_CONFIGURE_OPTIONS[@]}"
         fi
         execute make -j "$MJOBS"
         execute make install
