@@ -12,7 +12,19 @@ build_libsdl() {
     # a build host that happens to have its own SDL2 installed hides the problem entirely.
     if build "libsdl" "${VER_LIBSDL[0]}"; then
         download "https://github.com/libsdl-org/SDL/releases/download/release-$CURRENT_PACKAGE_VERSION/SDL2-$CURRENT_PACKAGE_VERSION.tar.gz"
-        execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static
+        # --disable-shared/--enable-static above only controls how libSDL2
+        # itself is packaged, not which video backends its own configure
+        # auto-detects. On a macOS build host with Homebrew's X11 libs
+        # present (libxcb/libX11/libXau/libXdmcp under /usr/local/opt),
+        # configure compiles in the X11 video driver anyway, and that driver
+        # still links those Homebrew paths dynamically even inside an
+        # otherwise-static SDL2 -- confirmed live: otool -L on the resulting
+        # ffmpeg showed all four, and it dyld-crashed on a machine without
+        # them. macOS never needs X11 (Cocoa is the native driver), so this
+        # is a straight disable everywhere, not a platform-conditional like
+        # build_gmp's --disable-assembly (20-tls.sh) -- this one's simply
+        # never wanted on any platform this project targets.
+        execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static --disable-video-x11
         execute make -j "$MJOBS"
         execute make install
 

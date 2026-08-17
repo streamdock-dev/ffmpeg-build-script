@@ -139,7 +139,15 @@ build_gnutls() {
         # Upstream files the tarballs under a major.minor series directory, so that
         # part of the path is derived from the pinned version rather than repeated.
         download "https://www.gnupg.org/ftp/gcrypt/gnutls/v${CURRENT_PACKAGE_VERSION%.*}/gnutls-$CURRENT_PACKAGE_VERSION.tar.xz"
-        execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static --disable-doc --disable-tools --disable-cxx --disable-tests --disable-gtk-doc-html --disable-libdane --disable-nls --enable-local-libopts --disable-guile --with-included-libtasn1 --with-included-unistring --without-p11-kit CPPFLAGS="${CFLAGS}" LDFLAGS="${LDFLAGS}"
+        # --without-p11-kit already guards against one Homebrew-host-detected
+        # optional dependency; --without-idn/--without-zstd close the same
+        # hole for two more -- confirmed live: a real build on a
+        # macos-15-intel GitHub Actions runner linked
+        # /usr/local/opt/libidn2, /usr/local/opt/libunistring (libidn2's own
+        # dependency, separate from --with-included-unistring above, which
+        # only covers gnutls's *own* internal use) and /usr/local/opt/zstd,
+        # and the resulting ffmpeg dyld-crashed on a machine without them.
+        execute ./configure --prefix="${WORKSPACE}" --disable-shared --enable-static --disable-doc --disable-tools --disable-cxx --disable-tests --disable-gtk-doc-html --disable-libdane --disable-nls --enable-local-libopts --disable-guile --with-included-libtasn1 --with-included-unistring --without-p11-kit --without-idn --without-zstd CPPFLAGS="${CFLAGS}" LDFLAGS="${LDFLAGS}"
         execute make -j "$MJOBS"
         execute make install
         build_done "gnutls" "$CURRENT_PACKAGE_VERSION"
