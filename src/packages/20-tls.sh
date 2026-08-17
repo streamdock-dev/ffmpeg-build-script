@@ -78,7 +78,11 @@ build_gmp() {
         # only rather than paying the portable-C fallback's slowdown
         # everywhere.
         GMP_CONFIGURE_OPTIONS=(--prefix="${WORKSPACE}" --disable-shared --enable-static)
-        if [[ "$OSTYPE" == "darwin"* && -z "$MACOS_SILICON" ]]; then
+        # $MACOS_SILICON is always set (true/false, never empty -- see
+        # 20-globals.sh) and this codebase's own convention is to invoke it
+        # directly as a command (see build_x264/build_libvpx/etc. in
+        # 30-video.sh), not string-test it with -z.
+        if [[ "$OSTYPE" == "darwin"* ]] && ! $MACOS_SILICON; then
             GMP_CONFIGURE_OPTIONS+=(--disable-assembly)
         fi
         if [ -n "$GMP_STD_FLAG" ]; then
