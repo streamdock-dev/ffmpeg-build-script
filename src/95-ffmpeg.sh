@@ -41,6 +41,21 @@ CURRENT_PACKAGE_NAME="ffmpeg"
 # version; see ffmpeg_tarball_url. The local filename carries the version either
 # way, so a cached tarball from a previous run is never mistaken for this one.
 download "$(ffmpeg_tarball_url "$FFMPEG_VERSION")" "FFmpeg-release-$FFMPEG_VERSION.tar.gz"
+
+# ffmpeg's own configure auto-detects libxcb via pkg-config independently of
+# libsdl's own --disable-video-x11 (55-other.sh) -- confirmed live: disabling
+# SDL2's X11 video driver alone did not stop the shipped ffmpeg binary from
+# linking /usr/local/opt/libxcb (+ its shm/shape/xfixes/render extensions)
+# and libX11/libXau/libXdmcp on a macOS build host with Homebrew's X11 libs
+# present. Those enable the x11grab input device, which is meaningless on
+# macOS anyway (avfoundation is the native screen-capture path), and none of
+# those libraries exist on an arbitrary end-user Mac. Linux is untouched --
+# x11grab is a real, wanted feature there, and the Linux jobs already build
+# clean without this leak.
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    CONFIGURE_OPTIONS+=(--disable-libxcb --disable-libxcb-shm --disable-libxcb-shape --disable-libxcb-xfixes)
+fi
+
 # shellcheck disable=SC2086
 
 execute ./configure "${CONFIGURE_OPTIONS[@]}" \
