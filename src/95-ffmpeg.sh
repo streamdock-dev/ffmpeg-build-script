@@ -54,6 +54,15 @@ download "$(ffmpeg_tarball_url "$FFMPEG_VERSION")" "FFmpeg-release-$FFMPEG_VERSI
 # clean without this leak.
 if [[ "$OSTYPE" == "darwin"* ]]; then
     CONFIGURE_OPTIONS+=(--disable-libxcb --disable-libxcb-shm --disable-libxcb-shape --disable-libxcb-xfixes)
+    # Closes the one X11 vector the libxcb disables above and the
+    # PKG_CONFIG_PATH fix (40-cli.sh) didn't reach: vaapi_x11_deps=xlib_x11
+    # in ffmpeg's own configure -- VAAPI's X11 backend, still linking
+    # /usr/local/opt/libx11 on a real macos-15-intel build after both of
+    # those, confirmed live via otool -L. VAAPI itself is Intel/Linux-driver
+    # hardware accel with no macOS equivalent (VideoToolbox is the real path
+    # there, already enabled), so this is a straight platform-correctness
+    # disable, not a workaround -- macOS never had any use for VAAPI at all.
+    CONFIGURE_OPTIONS+=(--disable-vaapi)
 fi
 
 # shellcheck disable=SC2086
