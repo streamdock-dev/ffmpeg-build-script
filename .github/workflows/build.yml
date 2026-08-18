@@ -198,6 +198,29 @@ jobs:
       - name: check shared library
         run: |
           otool -L ./workspace/bin/ffmpeg
+
+      # This project takes multiple CI round trips to find by hand: a build
+      # host with Homebrew's X11/idn2/zstd packages present (this runner
+      # image) lets ffmpeg's own configure and libsdl's both auto-detect and
+      # dynamically link them, even though every one of those was already
+      # explicitly --disable-d at some earlier point in this file -- xcb,
+      # vaapi, and xlib all turned out to be *separate*, independently
+      # auto-detected features, not one flag closing all of them. None of
+      # those Homebrew paths exist on an arbitrary end-user Mac, so a leak
+      # here means a real dyld crash for every real user, not just a lint
+      # nit -- hence a hard failure, not a warning. Anything outside
+      # /System or /usr/lib is host-specific and must not be there; the
+      # release package/upload steps below never run if this fails.
+      - name: verify no host-specific dynamic dependencies leaked in
+        run: |
+          for bin in ffmpeg ffprobe; do
+            leaked=$(otool -L "./workspace/bin/$bin" | tail -n +2 | awk '{print $1}' | grep -v '^/System/\|^/usr/lib/' || true)
+            if [ -n "$leaked" ]; then
+              echo "::error::$bin links host-specific libraries that won't exist on an end-user Mac:"
+              echo "$leaked"
+              exit 1
+            fi
+          done
       - name: test run ffmepg
         run: |
           ./workspace/bin/ffmpeg -buildconf

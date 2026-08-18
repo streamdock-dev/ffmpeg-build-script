@@ -63,6 +63,17 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     # there, already enabled), so this is a straight platform-correctness
     # disable, not a workaround -- macOS never had any use for VAAPI at all.
     CONFIGURE_OPTIONS+=(--disable-vaapi)
+    # --disable-vaapi didn't close it either -- confirmed live: a fresh
+    # macos-15-intel build with both fixes above still linked
+    # /usr/local/opt/libx11 alone (no xcb, no vaapi in the reported
+    # configuration, per that run's own "disabled" summary). ffmpeg's
+    # configure has a THIRD, independent X11 feature named plainly "xlib"
+    # (`./configure --help` lists it as "disable xlib [autodetect]",
+    # distinct from both the libxcb family and vaapi_x11) -- legacy
+    # Xlib-based screen-grab support, auto-detected via a direct compiler
+    # check rather than pkg-config, which is exactly why the
+    # PKG_CONFIG_PATH scoping (40-cli.sh) never reached it either.
+    CONFIGURE_OPTIONS+=(--disable-xlib)
 fi
 
 # shellcheck disable=SC2086
