@@ -154,6 +154,19 @@ if [[ ("$(uname -m)" == "arm64") && ("$OSTYPE" == "darwin"*) ]]; then
         echo "clang++ is not installed. Please install Xcode."
         exit 1
     fi
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+    # Intel Mac. Without an explicit deployment target the compiler defaults to
+    # whatever the build host's own SDK/OS is, and clang then links newer
+    # Apple APIs directly rather than weakly -- confirmed live: a
+    # macos-15-intel build of this project linked
+    # _AVCaptureDeviceTypeContinuityCamera (added in macOS 13) hard enough
+    # that the binary failed with "Symbol not found" at process launch, not
+    # a graceful feature check, on a real macOS 12 machine. Matches the
+    # arm64 branch's own MACOSX_DEPLOYMENT_TARGET above (11.0 is already
+    # Apple Silicon's actual floor, so using the same number here just keeps
+    # one minimum across both architectures rather than picking a second,
+    # unrelated value).
+    export MACOSX_DEPLOYMENT_TARGET=11.0
 fi
 
 # Speed up the process
