@@ -301,11 +301,28 @@ export PATH="${WORKSPACE}/bin:$PATH"
 MULTIARCH_DIR="$("${CC:-cc}" -print-multiarch 2>/dev/null)"
 
 PKG_CONFIG_PATH="$WORKSPACE/lib/pkgconfig"
-if [ -n "$MULTIARCH_DIR" ]; then
-    PKG_CONFIG_PATH+=":/usr/local/lib/${MULTIARCH_DIR}/pkgconfig:/usr/lib/${MULTIARCH_DIR}/pkgconfig"
+# Everything below this point exists so system-provided packages (libva,
+# alsa, libpulse -- see the comment above) are found on Linux, where that is
+# genuinely wanted. It should not extend to macOS: nothing there is supposed
+# to come from a system package -- every mac lib either gets built into
+# $WORKSPACE by this script or is an Apple framework linked directly via
+# -framework, never discovered through pkg-config. On Intel Macs specifically
+# it actively backfires, because /usr/local is also Homebrew's Intel prefix
+# (Apple Silicon's is /opt/homebrew, never on this list): confirmed live on a
+# macos-15-intel GitHub Actions runner, where this let ffmpeg's own configure
+# and libsdl's both auto-detect Homebrew's xcb/X11/idn2/zstd .pc files and
+# link them into the shipped binary, none of which exist on an arbitrary
+# end-user Mac. Explicit --disable-* flags were added at each of those
+# individual call sites first (55-other.sh, 95-ffmpeg.sh, 20-tls.sh) before
+# this was traced to its actual source; left in place as defense in depth,
+# not redundant with this.
+if [[ "$OSTYPE" != "darwin"* ]]; then
+    if [ -n "$MULTIARCH_DIR" ]; then
+        PKG_CONFIG_PATH+=":/usr/local/lib/${MULTIARCH_DIR}/pkgconfig:/usr/lib/${MULTIARCH_DIR}/pkgconfig"
+    fi
+    PKG_CONFIG_PATH+=":/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig"
+    PKG_CONFIG_PATH+=":/usr/lib/pkgconfig:/usr/share/pkgconfig:/usr/lib64/pkgconfig"
 fi
-PKG_CONFIG_PATH+=":/usr/local/lib/pkgconfig:/usr/local/share/pkgconfig"
-PKG_CONFIG_PATH+=":/usr/lib/pkgconfig:/usr/share/pkgconfig:/usr/lib64/pkgconfig"
 export PKG_CONFIG_PATH
 
 if ! command_exists "make"; then
