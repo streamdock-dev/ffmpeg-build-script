@@ -246,6 +246,100 @@ jobs:
         run: |
           ./build-ffmpeg --cleanup
 
+  # Fork-local addition, alongside build-macos above rather than folded into it: a second,
+  # independent build with ENABLE_SHARED=yes (src/95-ffmpeg.sh), producing real
+  # libavformat/libavcodec/libavutil/etc. .dylib files instead of only the static
+  # ffmpeg/ffprobe executables build-macos already publishes. Exists for StreamDock's own
+  # StreamDock.Core.Muxer, which links libavformat directly rather than shelling out to the CLI
+  # (see that repo's own CMakeLists.txt/NOTICE.md) -- the static build has nothing to link
+  # against, the same reason StreamDock's Windows leg already sources a separate shared BtbN
+  # build instead of its own bundled static ffmpeg_lgpl.exe. Kept as its own job (not a matrix
+  # axis on build-macos) so it can fail, be iterated on, or be removed without ever touching the
+  # existing static build's own green history.
+  build-macos-shared:
+    name: build in native macOS, shared libs (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: remove untrusted homebrew taps
+        run: |
+          brew untap aws/tap || true
+
+      - name: build ffmpeg (shared)
+        run: |
+          while sleep 300; do echo "=====[ $SECONDS seconds still running ]====="; done &
+          ENABLE_SHARED=yes SKIPINSTALL=yes VERBOSE=yes ./build-ffmpeg --build
+          kill %1
+
+      - name: check shared libraries were actually produced
+        run: |
+          shopt -s nullglob
+          dylibs=(workspace/lib/*.dylib)
+          if [ ${#dylibs[@]} -eq 0 ]; then
+            echo "::error::ENABLE_SHARED=yes produced no .dylib files in workspace/lib -- configure likely still resolved --disable-shared"
+            exit 1
+          fi
+          otool -L workspace/lib/libavformat.*.dylib
+
+      # Same rigor as build-macos's own "verify no host-specific dynamic dependencies leaked
+      # in", against the shared libraries themselves instead of the ffmpeg/ffprobe executables --
+      # this is the artifact a downstream consumer links against directly, so a leak here is a
+      # link-time/runtime failure on every machine but this one, not just a lint nit. Also
+      # confirms 95-ffmpeg.sh's own install_name rewrite actually ran: an unrewritten dylib would
+      # still reference its own sibling libs via this build's absolute $PWD/workspace/lib path,
+      # which is exactly what the grep below is scoped to catch alongside genuine Homebrew leaks.
+      - name: verify no host-specific dynamic dependencies leaked in
+        run: |
+          workspace_abs="$(cd workspace && pwd)"
+          for dylib in workspace/lib/*.dylib; do
+            leaked=$(otool -L "$dylib" | tail -n +2 | awk '{print $1}' | grep -v '^/System/\|^/usr/lib/\|^@rpath/' || true)
+            if [ -n "$leaked" ]; then
+              echo "::error::$dylib links dependencies that won't resolve once this file is moved elsewhere:"
+              echo "$leaked"
+              exit 1
+            fi
+          done
+          echo "workspace root was: $workspace_abs (only checked as context above, not matched against directly -- the @rpath allowlist already covers the rewritten-correctly case)"
+
+      # Gated on tag push only, same as build-macos -- no artifact is produced or uploaded for
+      # ordinary branch/PR builds. Only the ffmpeg-owned headers are packaged (not every
+      # dependency's own headers that also happen to land under workspace/include from the same
+      # shared --prefix), matching what StreamDock.Core.Muxer's own fetch-thirdparty.sh expects
+      # to find -- same include/lib layout convention as a BtbN release, one top-level directory.
+      - name: package shared release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          name="ffmpeg-shared-macos-${{ matrix.arch }}"
+          mkdir -p "$name/include" "$name/lib"
+          for d in workspace/include/libav* workspace/include/libsw*; do
+            [ -d "$d" ] && cp -R "$d" "$name/include/"
+          done
+          cp workspace/lib/*.dylib "$name/lib/"
+          cp LICENSE "$name/LICENSE.txt"
+          tar -cJf "$name.tar.xz" "$name"
+
+      - name: upload release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ffmpeg-shared-macos-${{ matrix.arch }}.tar.xz
+
+      - name: clean up
+        run: |
+          ./build-ffmpeg --cleanup
+
   build-docker:
     name: build in docker
     runs-on: ubuntu-24.04

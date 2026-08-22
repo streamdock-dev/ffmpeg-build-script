@@ -76,11 +76,24 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     CONFIGURE_OPTIONS+=(--disable-xlib)
 fi
 
+# Opt-in, off by default -- every existing caller of this script gets the exact same
+# static-only build it always has. Set ENABLE_SHARED=yes to additionally build real
+# libavformat/libavcodec/libavutil/etc. shared libraries alongside the static ffmpeg/ffprobe
+# binaries (which stay static either way -- --enable-static is unconditional below), for
+# consumers that need to link against them directly rather than shell out to the CLI (see
+# StreamDock.Core.Muxer's own CMakeLists.txt in the StreamDock repo for the motivating case).
+# Same "read a plain env var, no new CLI flag parsing" convention SKIPINSTALL/AUTOINSTALL
+# already use.
+FFMPEG_LIBRARY_OPTIONS=(--disable-shared)
+if [[ "$ENABLE_SHARED" == "yes" ]]; then
+    FFMPEG_LIBRARY_OPTIONS=(--enable-shared)
+fi
+
 # shellcheck disable=SC2086
 
 execute ./configure "${CONFIGURE_OPTIONS[@]}" \
+    "${FFMPEG_LIBRARY_OPTIONS[@]}" \
     --disable-debug \
-    --disable-shared \
     --enable-pthreads \
     --enable-static \
     --enable-version3 \
@@ -98,6 +111,33 @@ execute make install
 
 if [ -d "$CWD/.git.bak" ]; then
     mv "$CWD/.git.bak" "$CWD/.git"
+fi
+
+# ffmpeg's own build system derives each shared library's install_name from --prefix (i.e.
+# $WORKSPACE/lib/libavutil.61.dylib, an absolute build-machine path) unless told otherwise --
+# the exact same class of leak the build-macos CI job's "verify no host-specific dynamic
+# dependencies leaked in" step already exists to catch for the static ffmpeg/ffprobe binaries,
+# just for shared libs instead. Rewritten to @rpath here so the libraries stay relocatable once
+# copied anywhere else (a consumer sets its own rpath at link time -- see
+# StreamDock.Core.Muxer/CMakeLists.txt's rpath_next_to_binary() for the consuming side of this).
+# Discovers each real dependency reference via otool -L rather than assuming the exact string,
+# since guessing wrong would silently leave a real, undetected absolute-path leak in the shipped
+# release instead of failing loudly.
+if [[ "$ENABLE_SHARED" == "yes" && "$OSTYPE" == "darwin"* ]]; then
+    echo ""
+    echo "Rewriting shared library install names from $WORKSPACE/lib to @rpath for relocatability"
+    for dylib in "$WORKSPACE"/lib/*.dylib; do
+        [ -e "$dylib" ] || continue
+        name=$(basename "$dylib")
+        install_name_tool -id "@rpath/$name" "$dylib"
+    done
+    for dylib in "$WORKSPACE"/lib/*.dylib; do
+        [ -e "$dylib" ] || continue
+        while IFS= read -r dep; do
+            depname=$(basename "$dep")
+            install_name_tool -change "$dep" "@rpath/$depname" "$dylib"
+        done < <(otool -L "$dylib" | tail -n +2 | awk '{print $1}' | grep -F "$WORKSPACE/lib/")
+    done
 fi
 
 INSTALL_FOLDER="/usr" # not recommended, overwrites system ffmpeg package
