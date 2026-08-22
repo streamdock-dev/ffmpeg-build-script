@@ -22,7 +22,18 @@ build_giflib() {
 
 build_pkg_config() {
     if build "pkg-config" "${VER_PKG_CONFIG[0]}"; then
-        download "https://pkgconfig.freedesktop.org/releases/pkg-config-$CURRENT_PACKAGE_VERSION.tar.gz"
+        # FORK-LOCAL DEVIATION FROM UPSTREAM, not a permanent change -- revert to upstream's own
+        # https://pkgconfig.freedesktop.org/releases/pkg-config-$CURRENT_PACKAGE_VERSION.tar.gz
+        # once that host is reliable again (or when rebasing onto upstream master, whichever comes
+        # first -- we're not the active maintainers of markus-perl/ffmpeg-build-script and don't
+        # want to carry this diff longer than necessary). pkgconfig.freedesktop.org was confirmed
+        # unreachable (curl exitcode 28, connection timeout) both from a real CI run
+        # (streamdock-dev/ffmpeg-build-script's v9.0.7 tag build, build-macos x86_64 leg) and
+        # independently from a second, unrelated machine on 2026-08-22 -- a real host outage, not a
+        # one-off runner blip. distfiles.macports.org serves the byte-identical archive: confirmed
+        # its sha256 matches VER_PKG_CONFIG's already-pinned checksum exactly, so no checksum change
+        # was needed alongside this URL swap.
+        download "https://distfiles.macports.org/pkgconfig/pkg-config-$CURRENT_PACKAGE_VERSION.tar.gz"
         if [[ "$OSTYPE" == "darwin"* ]]; then
             CFLAGS+=" -Wno-int-conversion" # pkg-config 0.29.2 has a warning that is treated as an error
             CFLAGS+=" -Wno-error=int-conversion"
