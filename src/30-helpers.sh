@@ -140,8 +140,19 @@ download_with_retries() {
     # shellcheck disable=SC2086 # DOWNLOAD_MAX_RETRIES is an integer literal set in 20-globals.sh
     while [ $RETRY_COUNT -le $DOWNLOAD_MAX_RETRIES ]; do
         if [ $RETRY_COUNT -gt 0 ]; then
-            echo "Retrying download (attempt $((RETRY_COUNT + 1))/$((DOWNLOAD_MAX_RETRIES + 1))) in 10 seconds..."
-            sleep 10
+            # Exponential backoff capped at 60s (10/20/40/60/60), replacing a flat 10s. Retrying
+            # hard and fast is the wrong shape for the failures actually seen on macos-15-intel:
+            # curl exit 6 (could not resolve host) on download.videolan.org, three times across
+            # ~20 seconds, which killed a 100-minute build. DNS and mirror blips routinely outlast
+            # that window, and this costs nothing when downloads succeed first time.
+            case $RETRY_COUNT in
+            1) RETRY_DELAY=10 ;;
+            2) RETRY_DELAY=20 ;;
+            3) RETRY_DELAY=40 ;;
+            *) RETRY_DELAY=60 ;;
+            esac
+            echo "Retrying download (attempt $((RETRY_COUNT + 1))/$((DOWNLOAD_MAX_RETRIES + 1))) in ${RETRY_DELAY} seconds..."
+            sleep "$RETRY_DELAY"
         fi
 
         curl -4 -L --fail --silent -o "$2" "$1"

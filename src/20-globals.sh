@@ -54,7 +54,11 @@ CURRENT_PACKAGE_NAME=""
 # shellcheck disable=SC2034 # $CURRENT_PACKAGE_VERSION is read by later fragments
 CURRENT_PACKAGE_VERSION=0
 # shellcheck disable=SC2034 # $DOWNLOAD_MAX_RETRIES is read by later fragments
-DOWNLOAD_MAX_RETRIES=2
+# Fork-local: raised from 2 (3 attempts, fixed 10s apart = ~20s of tolerance). That was shorter
+# than an ordinary transient mirror or DNS blip, and a build is far more expensive to re-run than
+# a download is to wait on. With the backoff in download_with_retries this is ~190s of tolerance.
+# See 30-helpers.sh's download_with_retries for the failures that motivated it.
+DOWNLOAD_MAX_RETRIES=5
 
 # Version comparison function
 # Returns: 0 if v1 >= v2, 1 otherwise
