@@ -4,6 +4,15 @@ on:
   push:
     paths-ignore:
       - '*.md'
+    # Fork-local: mirror tags (btbn-mirror-*) exist only to carry mirrored third-party
+    # binaries as release assets -- see the StreamDock repo's download_ffmpeg_av job for why
+    # those are mirrored here. They point at the same commit as an existing v* tag, so
+    # building them re-runs the entire matrix (lint, native Linux, Linux+CUDA, full-static
+    # Docker, macOS on two runners) to produce nothing: every release-upload step is gated on
+    # startsWith(github.ref, 'refs/tags/v'), which a mirror tag never matches.
+    # Only tag pushes are affected; branch pushes and real v* tags build exactly as before.
+    tags-ignore:
+      - 'btbn-mirror-*'
   pull_request:
     branches: [ master ]
 
