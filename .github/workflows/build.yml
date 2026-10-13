@@ -11,6 +11,12 @@ on:
     # Docker, macOS on two runners) to produce nothing: every release-upload step is gated on
     # startsWith(github.ref, 'refs/tags/v'), which a mirror tag never matches.
     # Only tag pushes are affected; branch pushes and real v* tags build exactly as before.
+    # branches must be listed explicitly alongside tags-ignore: GitHub's rule is that if a push
+    # trigger defines ONLY tags/tags-ignore, the workflow stops running for branch pushes
+    # altogether. Omitting this turned the whole workflow tags-only and silently stopped building
+    # master -- which is exactly what happened between 614d9ba and 60c7785.
+    branches:
+      - '**'
     tags-ignore:
       - 'btbn-mirror-*'
   pull_request:
