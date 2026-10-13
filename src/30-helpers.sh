@@ -110,6 +110,16 @@ download_with_retries() {
     # --fail makes curl report an HTTP error instead of saving the error page as
     # if it were the requested file. A checksum mismatch counts as a failed
     # attempt, so a truncated or tampered mirror response is retried.
+    #
+    # --ipv4: fork-local addition, not upstream. Two unrelated dual-stack-vs-v4-only mirrors
+    # (ftp.gnu.org, pkgconfig.freedesktop.org) both failed with curl exitcode 28 (connect/transfer
+    # timeout) back to back on GitHub's macos-15-intel runner specifically, while ftp.gnu.org (which
+    # does publish an AAAA record) answered instantly over plain IPv4 from an unrelated machine on
+    # the same connection attempt -- the signature of a runner whose IPv6 egress is blackholed
+    # rather than the mirrors themselves being down, since curl's happy-eyeballs tries the AAAA
+    # address first and hangs instead of falling back quickly. Forcing IPv4 sidesteps that whole
+    # class of failure for every package, not just the two that happened to hit it first. Revert if
+    # rebasing onto upstream and this turns out not to be needed there.
     RETRY_COUNT=0
 
     # shellcheck disable=SC2086 # DOWNLOAD_MAX_RETRIES is an integer literal set in 20-globals.sh
@@ -119,7 +129,7 @@ download_with_retries() {
             sleep 10
         fi
 
-        curl -L --fail --silent -o "$2" "$1"
+        curl -4 -L --fail --silent -o "$2" "$1"
         EXITCODE=$?
 
         if [ $EXITCODE -eq 0 ] && [ -s "$2" ]; then
