@@ -120,6 +120,21 @@ download_with_retries() {
     # address first and hangs instead of falling back quickly. Forcing IPv4 sidesteps that whole
     # class of failure for every package, not just the two that happened to hit it first. Revert if
     # rebasing onto upstream and this turns out not to be needed there.
+    #
+    # What is NOT evidence for this, recorded so nobody re-derives it: the 2026-10-08 run failed
+    # with dav1d-1.5.4.tar.gz repeatedly "does not match its expected checksum", and that looked
+    # like the same truncated-transfer signature. It was not. The recorded checksum is correct (the
+    # live GitLab archive hashes to VER_DAV1D's value exactly), and both docker jobs that failed on
+    # it passed again on 2026-10-13 WITHOUT this flag -- so that failure was a transient bad
+    # transfer, not blackholed IPv6. This flag rests on the macos-15-intel curl-28 diagnosis above
+    # and nothing else.
+    #
+    # Baseline for judging whether it helps, measured on 2026-10-13 without the flag (run
+    # 38445949655, add-shared-macos-build, which predates it): the two macos-15-intel x86_64 jobs
+    # started first and were still running at 98 minutes, while the same build on macos-15 arm64
+    # finished in 60 and the slowest job that completed at all took 76. Intel runners are slower
+    # hardware regardless, so that gap is consistent with per-download IPv6 stalls but does not by
+    # itself prove them. Compare a master run that does carry the flag against those numbers.
     RETRY_COUNT=0
 
     # shellcheck disable=SC2086 # DOWNLOAD_MAX_RETRIES is an integer literal set in 20-globals.sh
