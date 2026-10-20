@@ -328,6 +328,50 @@ jobs:
           done
           echo "workspace root was: $workspace_abs (only checked as context above, not matched against directly -- the @rpath allowlist already covers the rewritten-correctly case)"
 
+      # The step above allowlists @rpath/ as correct, and it is -- but only for a consumer that
+      # links against these and supplies its own rpath. A consumer that dlopen()s them by absolute
+      # path from a process with no rpath (.NET's NativeLibrary.Load, how StreamDock consumes them)
+      # needs each library to carry @loader_path itself, which 95-ffmpeg.sh now adds. That is
+      # invisible to otool-based checks: a dylib with zero LC_RPATH passes the grep above happily,
+      # and then resolves only if the consumer happens to load in strict dependency order. So this
+      # tests the property directly, by loading the library with the most dependencies FIRST.
+      - name: verify the libraries load without a host rpath, in any order
+        run: |
+          cat > /tmp/dlopen_probe.c <<'EOF'
+          #include <stdio.h>
+          #include <dlfcn.h>
+          int main(int argc, char **argv) {
+              void *h = dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL);
+              if (h) return 0;
+              fprintf(stderr, "%s\n", dlerror());
+              return 1;
+          }
+          EOF
+          clang -O1 -o /tmp/dlopen_probe /tmp/dlopen_probe.c
+          staged=/tmp/libav-rpath-check
+          mkdir -p "$staged"
+          cp -a workspace/lib/*.dylib "$staged/"
+          # A glob into the positional parameters rather than `ls | head -1`: head closes the
+          # pipe, ls dies of SIGPIPE, and these steps run with pipefail.
+          set -- "$staged"/libavdevice.*.dylib "$staged"/libavformat.*.dylib
+          target=""
+          for candidate in "$@"; do
+            if [ -e "$candidate" ]; then
+              target="$candidate"
+              break
+            fi
+          done
+          if [ -z "$target" ]; then
+            echo "::error::no libavdevice/libavformat dylib to probe"
+            exit 1
+          fi
+          echo "probing $target with nothing preloaded"
+          if ! /tmp/dlopen_probe "$target"; then
+            echo "::error::dlopen of $(basename "$target") failed with no sibling preloaded -- the libraries resolve only in dependency order. Each needs @loader_path as its own LC_RPATH (see src/95-ffmpeg.sh)."
+            exit 1
+          fi
+          echo "loaded standalone, so every @rpath reference resolved from the library's own rpath"
+
       # Gated on tag push only, same as build-macos -- no artifact is produced or uploaded for
       # ordinary branch/PR builds. Only the ffmpeg-owned headers are packaged (not every
       # dependency's own headers that also happen to land under workspace/include from the same

@@ -49,7 +49,9 @@ runners behind shared NAT, and would add a `jq` dependency.
 The `release-version-check` job asserts that a pushed tag matches `SCRIPT_VERSION` *in the
 tagged commit*, read from `src/00-header.sh` (`v9.0.3` requires `SCRIPT_VERSION=9.0.3`), so
 master carrying the next
-release's version is legal while a mismatched tag fails. It does not gate on the builds —
+release's version is legal while a mismatched tag fails. The comparison is a plain string
+equality against `v$SCRIPT_VERSION`, which is what lets this fork's suffixed versions through
+(see "Adding a package" step 6). It does not gate on the builds —
 there is no artifact to withhold, so it reports in seconds instead of after an hour.
 
 ## Style and tooling
@@ -206,6 +208,12 @@ once: `--enable-gpl-and-non-free` → gettext + openssl; default LGPL → gmp + 
    It names the *next* release, not the current commit, so a whole batch of unreleased
    commits shares one bump. Check `git tag | tail -1` first: bumping again while master is
    already ahead skips a version and makes the `release-version-check` job's tag assertion fail.
+   **This fork's versions carry a `-streamdock.<n>` suffix** — `9.0.8-streamdock.1`, not
+   `9.0.9` — because the bare `<ffmpeg major>.<ffmpeg minor>.<n>` counter is upstream's and
+   incrementing it claims a number upstream uses for different code. `CONTRIBUTING.md` has the
+   reasoning. Note `git tag` in a clone made with `gh repo clone` also lists the `upstream`
+   remote's tags, which is how upstream's v9.0.9/v9.0.10 appear despite not existing in this
+   repo; `git ls-remote --tags origin` is the honest answer to "what has this fork released".
 
 Prefer `--disable-shared --enable-static` and disabling docs, tests, examples and CLI tools:
 everything here is a static link into one binary and nothing else consumes these installs.

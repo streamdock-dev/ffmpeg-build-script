@@ -138,6 +138,30 @@ if [[ "$ENABLE_SHARED" == "yes" && "$OSTYPE" == "darwin"* ]]; then
             install_name_tool -change "$dep" "@rpath/$depname" "$dylib"
         done < <(otool -L "$dylib" | tail -n +2 | awk '{print $1}' | grep -F "$WORKSPACE/lib/")
     done
+    # Each library then gets @loader_path as an LC_RPATH of its own. @rpath alone resolves against
+    # the rpath of whatever is doing the loading, so it covers a consumer that links against these
+    # and sets its own (Core.Muxer), but NOT one that dlopen()s them by absolute path from a
+    # process with no rpath at all -- which is how .NET's NativeLibrary.Load consumes them in
+    # StreamDock. Without this, such a consumer only works if it happens to load the libraries in
+    # strict dependency order, because dyld then satisfies each @rpath reference from an
+    # already-loaded image whose install name matches; asking for libavcodec first instead fails
+    # with "Library not loaded: @rpath/libswresample.N.dylib ... Reason: no LC_RPATH's found".
+    # Measured both ways on a real published ffmpeg-shared-macos-arm64 asset, 2026-10-19.
+    #
+    # Purely additive: the install names stay @rpath, so a linking consumer is unaffected, and an
+    # rpath entry on the library itself is just one more place dyld looks. install_name_tool
+    # re-signs ad-hoc on its own (the result reports "flags=0x20002(adhoc,linker-signed)"), so no
+    # separate codesign step is needed. -add_rpath refuses to add a duplicate, so an entry that is
+    # already there is skipped rather than relying on that error being harmless -- a rerun over an
+    # existing workspace/ is normal.
+    for dylib in "$WORKSPACE"/lib/*.dylib; do
+        [ -e "$dylib" ] || continue
+        existing=$(otool -l "$dylib" | awk '/LC_RPATH/ { found = 1 } found && $1 == "path" { print $2; found = 0 }')
+        case " $existing " in
+        *" @loader_path "*) ;;
+        *) install_name_tool -add_rpath "@loader_path" "$dylib" ;;
+        esac
+    done
 fi
 
 INSTALL_FOLDER="/usr" # not recommended, overwrites system ffmpeg package

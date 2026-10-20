@@ -125,6 +125,20 @@ order, and it has to keep running everywhere it currently runs:
   the two are easy to keep aligned. The older 1.x numbering ran independently of FFmpeg and
   said nothing about what you were getting.
 
+  **This fork suffixes its own releases: `<upstream version>-streamdock.<n>`.** `n` in the
+  scheme above is upstream's counter, and incrementing it here claims a number upstream will
+  also use for different code -- v9.0.6 through v9.0.8 were published that way and already
+  overlap upstream's. A suffixed version is unambiguous about which lineage it is, and it is
+  what the project's other forks use (`godot-cef` ships `v1.15.3-streamdock.3`). So the
+  release after 9.0.8 is `9.0.8-streamdock.1`: upstream 9.0.8 plus our first set of changes,
+  rather than a claim on 9.0.9.
+
+  Nothing parses the version. `release-version-check` compares `v$SCRIPT_VERSION` to the tag
+  as a plain string, the installers resolve `/releases/latest` and fetch that tag's archive
+  without reading the name, and `--version` only prints it. Git's default version sort also
+  ranks `v9.0.8-streamdock.1` above `v9.0.8`, so `git tag | tail -1` still answers the
+  question step 6 asks it.
+
 [AGENTS.md](AGENTS.md) documents the internals in more depth — the anatomy of a package
 function, the license and capability gates, the build order array, and the traps that are easy
 to fall into. It is written for AI coding agents, but it is the most complete description of how
