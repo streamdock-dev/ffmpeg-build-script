@@ -1,0 +1,237 @@
+# Builds the macOS libav *shared dev kit* that StreamDock loads in-process, and uploads it to an
+# existing release. Separate from build.yml on purpose, and deliberately NOT built with
+# build-ffmpeg:
+#
+#   - It has to be FFmpeg 7.1.x. Sdcb.FFmpeg 7.0.0 (the ABI pin on the consuming side) resolves
+#     its DllImports against libavutil.59/libavcodec.61/libavformat.61/libavdevice.61 and cannot
+#     bind to anything else. build-ffmpeg builds its own pinned FFMPEG_VERSION, which is 9.x.
+#   - It wants no third-party libraries at all. The consumer needs decode plus the avfoundation
+#     input device, not ~70 codecs, so there is no licensing surface beyond FFmpeg itself and the
+#     build takes minutes instead of an hour. --disable-autodetect is what makes that true and is
+#     not optional here: FFmpeg's configure links whatever it happens to find, and the first
+#     hand-built pair of these kits silently picked up Homebrew's sdl2-compat into libavdevice,
+#     which loads only on a machine that also has it. A hosted runner carries far more preinstalled
+#     Homebrew than a dev box, so autodetect would make the artifact depend on the runner image.
+#     With it off, "External libraries:" reports avfoundation and nothing else.
+#
+# Triggered by hand, because its output is a pinned artifact that only changes when the FFmpeg
+# generation does -- not something to rebuild on every push. Each architecture is built AND
+# exercised on its own runner, which is the point: a cross-compiled slice can be produced on one
+# machine but never executed, and that was the known gap in the first hand-built pair of these.
+#
+# See StreamDock's Docs/Reference/ThirdParty/ffmpeg-lgpl-fork-status.md for why this kit exists.
+name: libav kit (macOS, shared)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: FFmpeg release to build (must be 7.1.x for Sdcb.FFmpeg 7.0.0)
+        required: true
+        default: "7.1.4"
+      sha256:
+        description: sha256 of ffmpeg-<version>.tar.xz (ffmpeg.org publishes no checksum file)
+        required: true
+        default: "71f4aac3573ed9060489cb62526a6c7dda815ae10993789611acd7be9fa9fbf4"
+      release_tag:
+        description: existing release tag to upload the kit to
+        required: true
+        default: "btbn-mirror-n7.1.4"
+      macos_min:
+        description: deployment target; must not exceed what the consuming app supports
+        required: true
+        default: "11.0"
+
+jobs:
+  libav-kit:
+    name: libav kit (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - name: fetch and verify the FFmpeg source
+        run: |
+          ver='${{ inputs.ffmpeg_version }}'
+          case "$ver" in
+          7.1.*) ;;
+          *)
+              echo "::error::$ver is not 7.1.x; Sdcb.FFmpeg 7.0.0 cannot bind to another generation"
+              exit 1
+              ;;
+          esac
+          curl --fail -L --retry 6 --retry-all-errors --connect-timeout 30 \
+            "https://ffmpeg.org/releases/ffmpeg-$ver.tar.xz" -o ffmpeg.tar.xz
+          echo '${{ inputs.sha256 }}  ffmpeg.tar.xz' > ffmpeg.tar.xz.sha256
+          shasum -a 256 -c ffmpeg.tar.xz.sha256
+          mkdir -p src
+          tar -xJf ffmpeg.tar.xz -C src --strip-components=1
+
+      # --install-name-dir=@loader_path, not @rpath: this kit is dlopen'd by absolute path from a
+      # process with no rpath of its own, where @rpath resolves only if the libraries happen to be
+      # loaded in strict dependency order. src/95-ffmpeg.sh carries the long version of this.
+      - name: configure and build
+        run: |
+          cd src
+          ./configure \
+            --prefix="$PWD/../out" \
+            --enable-shared --disable-static \
+            --disable-programs --disable-doc \
+            --disable-autodetect \
+            --enable-videotoolbox --enable-audiotoolbox --enable-avfoundation \
+            --enable-zlib --enable-bzlib \
+            --install-name-dir='@loader_path' \
+            --extra-cflags="-mmacosx-version-min=${{ inputs.macos_min }}" \
+            --extra-ldflags="-mmacosx-version-min=${{ inputs.macos_min }}" 2>&1 | tee configure.out
+          # configure prints this on stdout and records it nowhere else, so it is captured above
+          # and grepped from the file -- checked here rather than after the build so a licensing
+          # surprise costs seconds instead of minutes.
+          grep -q '^License: LGPL' configure.out || {
+              echo "::error::configure did not report an LGPL license:"
+              grep -i '^License' configure.out || true
+              exit 1
+          }
+          grep -A1 'Enabled indevs' configure.out | grep -q avfoundation || {
+              echo "::error::avfoundation is not among the enabled input devices"
+              exit 1
+          }
+          # Assert WHICH external libraries got linked, not just that the build succeeded. The
+          # downstream "non-relocatable references" check only catches a leak that lives outside
+          # /usr/lib, and only after a five-minute build; this names the cause immediately. It also
+          # catches --disable-autodetect silently not applying, which is how the first hand-built
+          # kit acquired Homebrew's sdl2: the flag reached configure inside a single quoted
+          # argument and was ignored rather than rejected.
+          externals=$(awk '/^External libraries:/ { grab = 1; next } /^External libraries providing/ { grab = 0 } grab && NF { for (i = 1; i <= NF; i++) print $i }' configure.out | sort -u)
+          # zlib and bzlib are re-enabled explicitly on top of --disable-autodetect: they are in
+          # /usr/lib on every macOS, so they cannot make the kit unportable, and dropping them
+          # would silently cost the consumer container and codec features it had before --
+          # RecorderService uses this same kit to decode source files, not just to open a camera.
+          # iconv is NOT re-enabled, though it is equally system-resident: --enable-iconv forces
+          # the feature on while --disable-autodetect skips the check that would add -liconv, so
+          # libavcodec ends up referencing _iconv/_iconv_open/_iconv_close with nothing providing
+          # them and the link fails. It only serves subtitle charset conversion, which neither
+          # consumer uses, so it is dropped rather than patched with --extra-libs.
+          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(avfoundation|zlib|bzlib)$' || true)
+          if [ -n "$unexpected" ]; then
+              echo "::error::configure linked external libraries beyond the expected system set, so this kit would only load on a machine that has them:"
+              printf '%s\n' "$unexpected"
+              exit 1
+          fi
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+      # Everything the consumer actually depends on, checked on the architecture that will run it.
+      - name: verify the kit
+        run: |
+          lib=out/lib
+          fail=0
+          for soname in libavutil.59 libswresample.5 libswscale.8 libavcodec.61 \
+            libavformat.61 libavfilter.10 libavdevice.61; do
+              if [ ! -e "$lib/$soname.dylib" ]; then
+                  echo "::error::missing $soname.dylib"
+                  fail=1
+              fi
+          done
+
+          arch=$(lipo -info "$lib/libavcodec.61.dylib" | sed 's/.*: //')
+          [ "$arch" = "${{ matrix.arch }}" ] || { echo "::error::built $arch, expected ${{ matrix.arch }}"; fail=1; }
+
+          # The floor is the builder's own OS version unless it was passed explicitly, and that
+          # failure is invisible on the machine that produces it.
+          for dylib in "$lib"/*.dylib; do
+              [ -L "$dylib" ] && continue
+              # No early exit in the awk: it would SIGPIPE vtool, and pipefail would fail the step.
+              minos=$(vtool -show-build "$dylib" | awk '/minos/ { m = $2 } END { print m }')
+              [ "$minos" = "${{ inputs.macos_min }}" ] || { echo "::error::$(basename "$dylib") minos=$minos, expected ${{ inputs.macos_min }}"; fail=1; }
+          done
+
+          # No absolute build paths and no @rpath: every reference must be @loader_path, so the
+          # set is relocatable and load-order independent.
+          for dylib in "$lib"/*.dylib; do
+              [ -L "$dylib" ] && continue
+              leaked=$(otool -L "$dylib" | tail -n +2 | awk '{print $1}' | grep -v '^/System/\|^/usr/lib/\|^@loader_path/' || true)
+              if [ -n "$leaked" ]; then
+                  echo "::error::$(basename "$dylib") has non-relocatable references:"
+                  echo "$leaked"
+                  fail=1
+              fi
+              while IFS= read -r dep; do
+                  [ -n "$dep" ] || continue
+                  [ -e "$lib/${dep#@loader_path/}" ] || { echo "::error::$(basename "$dylib") names $dep, which is not in the kit"; fail=1; }
+              done < <(otool -L "$dylib" | tail -n +2 | awk '{print $1}' | grep '^@loader_path/' | sort -u)
+          done
+
+          # Dumped to a file first: `strings | grep -m1` has grep close the pipe on its match,
+          # which SIGPIPEs strings, and under pipefail that reads as failure.
+          strings "$lib"/libavutil.59*.dylib > avutil.strings
+          cfg=$(grep -m1 -- '--enable-shared' avutil.strings || true)
+          case "$cfg" in
+          *--enable-gpl* | *--enable-nonfree*)
+              echo "::error::GPL or non-free flags present: $cfg"
+              fail=1
+              ;;
+          esac
+
+          [ "$fail" -eq 0 ] || exit 1
+          echo "static checks passed for ${{ matrix.arch }}"
+
+      # The reason each slice is built on its own runner rather than cross-compiled: this actually
+      # executes it. Loads the whole set by absolute path with nothing preloaded and the most
+      # dependent library FIRST, then asks libavdevice whether avfoundation is registered -- the
+      # capability a webcam or display-capture source needs. Opening a device is not possible here
+      # (a hosted runner has no camera), so registration is as far as this can honestly go.
+      - name: load the kit and confirm avfoundation registers
+        run: |
+          cat > probe.c <<'EOF'
+          #include <stdio.h>
+          #include <string.h>
+          #include <dlfcn.h>
+          int main(int argc, char **argv) {
+              char path[2048];
+              snprintf(path, sizeof path, "%s/libavdevice.61.dylib", argv[1]);
+              void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+              if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+              void (*reg)(void) = dlsym(h, "avdevice_register_all");
+              const void *(*next)(const void *) = dlsym(h, "av_input_video_device_next");
+              if (!reg || !next) { fprintf(stderr, "dlsym failed\n"); return 2; }
+              reg();
+              const void *f = NULL;
+              while ((f = next(f))) {
+                  const char *n = *(const char *const *)f;
+                  if (n && !strcmp(n, "avfoundation")) { printf("avfoundation registered\n"); return 0; }
+              }
+              fprintf(stderr, "avfoundation not registered\n");
+              return 3;
+          }
+          EOF
+          clang -O1 -o probe probe.c
+          ./probe "$PWD/out/lib"
+
+      - name: package the kit
+        run: |
+          ver='${{ inputs.ffmpeg_version }}'
+          name="ffmpeg-n$ver-macos-${{ matrix.arch }}-lgpl-shared-${ver%.*}"
+          mkdir -p "$name"
+          # -a keeps the symlink farm: dyld resolves a dependency through whichever recorded name
+          # it finds, and dereferencing triples the size for no gain.
+          cp -a out/lib "$name/lib"
+          cp -a out/include "$name/include"
+          rm -rf "$name/lib/pkgconfig"
+          cp src/COPYING.LGPLv2.1 "$name/"
+          tar -cJf "$name.tar.xz" "$name"
+          shasum -a 256 "$name.tar.xz" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "KIT=$name.tar.xz" >> "$GITHUB_ENV"
+
+      - name: upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload '${{ inputs.release_tag }}' "$KIT" --clobber \
+            --repo '${{ github.repository }}'
