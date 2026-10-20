@@ -256,6 +256,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ffmpeg-macos-${{ matrix.arch }}-lgpl.tar.xz
+          # Created as a prerelease, promoted by promote-release once every macOS job has
+          # uploaded. GitHub publishes a release the moment a tag is pushed and
+          # /releases/latest moves to it immediately, while these assets do not exist until
+          # the from-source build finishes well over an hour later -- so without this, every
+          # tag push breaks the consumers that resolve latest/download (the StreamDock repo's
+          # download_ffmpeg_bins job and its setup_macos_dev.sh). Measured, not theorised:
+          # pushing v9.0.8-streamdock.1 404'd both macOS CLI assets until the release was
+          # flagged prerelease by hand. Core.Muxer's fetch-thirdparty.sh pins a tag instead
+          # and was unaffected.
+          prerelease: true
 
       - name: clean up
         run: |
@@ -394,6 +404,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ffmpeg-shared-macos-${{ matrix.arch }}.tar.xz
+          # See the same input on build-macos's upload step for why.
+          prerelease: true
 
       - name: clean up
         run: |
@@ -483,6 +495,46 @@ jobs:
   # is already a push event (and path filters do not apply to tags), so lint
   # and the five builds run for the tag as-is, while adding a `tags:` filter
   # there would stop branch pushes from triggering anything at all.
+  # Clears the prerelease flag the upload steps set, so /releases/latest only ever moves to a
+  # release that already carries every asset. Asserts the full set first rather than trusting
+  # job success: an upload step that silently did not run would otherwise be promoted anyway,
+  # which is the failure this whole arrangement exists to prevent. Uses the REST API rather than
+  # `gh release edit` because make_latest and clearing a boolean are explicit there.
+  promote-release:
+    name: promote the release once every asset is attached
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-macos, build-macos-shared]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: check every macOS asset is present, then mark it latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          expected="ffmpeg-macos-arm64-lgpl.tar.xz ffmpeg-macos-x86_64-lgpl.tar.xz ffmpeg-shared-macos-arm64.tar.xz ffmpeg-shared-macos-x86_64.tar.xz"
+          # Read once into a variable, and with tr rather than grep: `gh api | grep -q` would
+          # have grep close the pipe on its first match, gh die of SIGPIPE, and pipefail report
+          # that as failure. tr consumes all of its input, so it cannot.
+          present=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.assets[].name' | tr '\n' ' ')
+          missing=0
+          for asset in $expected; do
+            case " $present " in
+            *" $asset "*) ;;
+            *)
+                echo "::error::$TAG is missing $asset, so it must not become /releases/latest"
+                missing=1
+                ;;
+            esac
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.id')
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/releases/${id}" \
+            -F prerelease=false -f make_latest=true >/dev/null
+          echo "promoted $TAG: prerelease cleared, marked latest"
+
   release-version-check:
     name: check the tag matches SCRIPT_VERSION
     if: startsWith(github.ref, 'refs/tags/v')
