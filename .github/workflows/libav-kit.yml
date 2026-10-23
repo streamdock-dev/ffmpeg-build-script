@@ -127,6 +127,28 @@ jobs:
           make -j"$(sysctl -n hw.ncpu)"
           make install
 
+          # Give each library its own leaf name as its LC_ID_DYLIB, leaving every dependency
+          # reference as @loader_path/... exactly as configure wrote it.
+          #
+          # --install-name-dir sets both, and the id it produces (@loader_path/libavutil.59.dylib)
+          # makes the kit unloadable by its real consumer. .NET reaches these through
+          # [DllImport("libavutil.59.dylib")], which is a bare-name dlopen, and dyld matches a
+          # bare name against an already-loaded image ONLY by that image's install name -- never
+          # by the path it was loaded from. So the consumer's preload of every library by
+          # absolute path succeeds, logs nothing, and then every call fails with
+          # DllNotFoundException. Measured both ways on an M1: with the id as shipped the
+          # bare-name load throws, with the id rewritten to the leaf it resolves.
+          #
+          # Only the id changes, so the relocatability this kit is built for is untouched: the
+          # dependency entries verified below stay @loader_path-relative and load-order
+          # independent. Re-signing follows because install_name_tool invalidates the signature.
+          for dylib in out/lib/*.dylib; do
+              [ -L "$dylib" ] && continue
+              leaf=$(basename "$dylib" | cut -d. -f1,2).dylib
+              install_name_tool -id "$leaf" "$dylib"
+              codesign -f -s - "$dylib"
+          done
+
       # Everything the consumer actually depends on, checked on the architecture that will run it.
       - name: verify the kit
         run: |
@@ -150,6 +172,17 @@ jobs:
               # No early exit in the awk: it would SIGPIPE vtool, and pipefail would fail the step.
               minos=$(vtool -show-build "$dylib" | awk '/minos/ { m = $2 } END { print m }')
               [ "$minos" = "${{ inputs.macos_min }}" ] || { echo "::error::$(basename "$dylib") minos=$minos, expected ${{ inputs.macos_min }}"; fail=1; }
+          done
+
+          # Each library's own id must be its bare leaf name, which is what lets a bare-name
+          # dlopen find it once it has been loaded by absolute path. A kit that regressed to
+          # @loader_path here would still pass every other check and then fail to load at all in
+          # the consumer, with nothing in its log naming the cause.
+          for dylib in "$lib"/*.dylib; do
+              [ -L "$dylib" ] && continue
+              id=$(otool -D "$dylib" | tail -1)
+              leaf=$(basename "$dylib" | cut -d. -f1,2).dylib
+              [ "$id" = "$leaf" ] || { echo "::error::$(basename "$dylib") has install name '$id', expected '$leaf'"; fail=1; }
           done
 
           # No absolute build paths and no @rpath: every reference must be @loader_path, so the
