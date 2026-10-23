@@ -57,6 +57,14 @@ jobs:
           - runner: macos-15-intel
             arch: x86_64
     steps:
+      # FFmpeg's x86 assembly needs nasm, which the macOS runner images do not carry. Without it
+      # configure stops at "nasm/yasm not found or too old", and because it stops, the LGPL
+      # licence line it is grepped for never appears either -- so the failure reads as a
+      # licensing problem rather than a missing tool. Harmless on arm64, where there is no x86
+      # assembly to build, so it is not matrix-conditional.
+      - name: install the assembler FFmpeg's x86 code needs
+        run: brew install nasm
+
       - name: fetch and verify the FFmpeg source
         run: |
           ver='${{ inputs.ffmpeg_version }}'
@@ -142,7 +150,10 @@ jobs:
           # Only the id changes, so the relocatability this kit is built for is untouched: the
           # dependency entries verified below stay @loader_path-relative and load-order
           # independent. Re-signing follows because install_name_tool invalidates the signature.
-          for dylib in out/lib/*.dylib; do
+          # ../out, not out: this step starts with `cd src`, and configure's prefix is
+          # "$PWD/../out" from there. The verify step below is a separate step that starts at
+          # the workspace root, which is why its own path is out/lib.
+          for dylib in ../out/lib/*.dylib; do
               [ -L "$dylib" ] && continue
               leaf=$(basename "$dylib" | cut -d. -f1,2).dylib
               install_name_tool -id "$leaf" "$dylib"
