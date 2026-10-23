@@ -200,7 +200,13 @@ jobs:
           # set is relocatable and load-order independent.
           for dylib in "$lib"/*.dylib; do
               [ -L "$dylib" ] && continue
-              leaked=$(otool -L "$dylib" | tail -n +2 | awk '{print $1}' | grep -v '^/System/\|^/usr/lib/\|^@loader_path/' || true)
+              # otool -L prints the file path, then the library's own LC_ID_DYLIB, then the
+              # dependencies. tail -n +2 drops the path but keeps the id, which is now a bare
+              # leaf name and would read as a non-relocatable dependency -- so the id is
+              # excluded by value rather than by counting lines, which otool's output shape
+              # does not guarantee. Nothing can legitimately depend on itself.
+              self_id=$(otool -D "$dylib" | tail -1)
+              leaked=$(otool -L "$dylib" | tail -n +2 | awk '{print $1}' | grep -vxF "$self_id" | grep -v '^/System/\|^/usr/lib/\|^@loader_path/' || true)
               if [ -n "$leaked" ]; then
                   echo "::error::$(basename "$dylib") has non-relocatable references:"
                   echo "$leaked"
