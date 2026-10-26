@@ -5,14 +5,17 @@
 #   - It has to be FFmpeg 7.1.x. Sdcb.FFmpeg 7.0.0 (the ABI pin on the consuming side) resolves
 #     its DllImports against libavutil.59/libavcodec.61/libavformat.61/libavdevice.61 and cannot
 #     bind to anything else. build-ffmpeg builds its own pinned FFMPEG_VERSION, which is 9.x.
-#   - It wants no third-party libraries at all. The consumer needs decode plus the avfoundation
-#     input device, not ~70 codecs, so there is no licensing surface beyond FFmpeg itself and the
-#     build takes minutes instead of an hour. --disable-autodetect is what makes that true and is
+#   - It wants one third-party library and no more. The consumer needs decode plus the
+#     avfoundation input device, not ~70 codecs, so the build takes minutes instead of an hour.
+#     The one exception is dav1d (BSD-2-Clause), because FFmpeg 7.1 has no native AV1 software
+#     decoder and VideoToolbox decodes AV1 only on M3 and later: without it an M1/M2 Mac cannot
+#     play an AV1 file at all. It is built from a pinned, checksummed tarball as a static PIC
+#     archive and linked INTO libavcodec, so the kit still depends on nothing outside itself. --disable-autodetect is what makes that true and is
 #     not optional here: FFmpeg's configure links whatever it happens to find, and the first
 #     hand-built pair of these kits silently picked up Homebrew's sdl2-compat into libavdevice,
 #     which loads only on a machine that also has it. A hosted runner carries far more preinstalled
 #     Homebrew than a dev box, so autodetect would make the artifact depend on the runner image.
-#     With it off, "External libraries:" reports avfoundation and nothing else.
+#     With it off, "External libraries:" reports exactly the set asserted below.
 #
 # Triggered by hand, because its output is a pinned artifact that only changes when the FFmpeg
 # generation does -- not something to rebuild on every push. Each architecture is built AND
@@ -37,6 +40,14 @@ on:
         description: existing release tag to upload the kit to
         required: true
         default: "btbn-mirror-n7.1.4"
+      dav1d_version:
+        description: dav1d release linked statically into libavcodec for AV1 software decode
+        required: true
+        default: "1.5.4"
+      dav1d_sha256:
+        description: sha256 of dav1d-<version>.tar.xz (as published alongside it on videolan.org)
+        required: true
+        default: "686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5"
       macos_min:
         description: deployment target; must not exceed what the consuming app supports
         required: true
@@ -62,8 +73,39 @@ jobs:
       # licence line it is grepped for never appears either -- so the failure reads as a
       # licensing problem rather than a missing tool. Harmless on arm64, where there is no x86
       # assembly to build, so it is not matrix-conditional.
+      # meson and ninja build dav1d; pkgconf is how FFmpeg's configure finds it. dav1d's x86
+      # assembly needs nasm too.
       - name: install the assembler FFmpeg's x86 code needs
-        run: brew install nasm
+        run: brew install nasm meson ninja pkgconf
+
+      # Static and position-independent, so it links into libavcodec.dylib and the kit gains no
+      # dylib to ship or relocate. The deployment target goes in through the environment as well
+      # as the flags so meson's own compiler probes and the assembler agree with the final link;
+      # the minos check in the verify step covers the result either way.
+      - name: build dav1d (static, for AV1 decode)
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ inputs.macos_min }}
+        run: |
+          ver='${{ inputs.dav1d_version }}'
+          curl --fail -L --retry 6 --retry-all-errors --connect-timeout 30 \
+            "https://downloads.videolan.org/pub/videolan/dav1d/$ver/dav1d-$ver.tar.xz" -o dav1d.tar.xz
+          echo '${{ inputs.dav1d_sha256 }}  dav1d.tar.xz' > dav1d.tar.xz.sha256
+          shasum -a 256 -c dav1d.tar.xz.sha256
+          mkdir -p dav1d-src
+          tar -xJf dav1d.tar.xz -C dav1d-src --strip-components=1
+          meson setup dav1d-src/build dav1d-src \
+            --prefix="$PWD/dav1d-out" --libdir=lib \
+            --buildtype=release --default-library=static -Db_staticpic=true \
+            -Denable_tools=false -Denable_tests=false -Denable_examples=false \
+            -Dc_args="-mmacosx-version-min=${{ inputs.macos_min }}" \
+            -Dc_link_args="-mmacosx-version-min=${{ inputs.macos_min }}"
+          ninja -C dav1d-src/build install
+          # A shared libdav1d next to the archive would be preferred by the linker and leak an
+          # absolute path into libavcodec; the verify step would catch it, this names it sooner.
+          if ls dav1d-out/lib/libdav1d*.dylib >/dev/null 2>&1; then
+              echo "::error::dav1d produced a dylib; it must be static only"
+              exit 1
+          fi
 
       - name: fetch and verify the FFmpeg source
         run: |
@@ -86,6 +128,8 @@ jobs:
       # process with no rpath of its own, where @rpath resolves only if the libraries happen to be
       # loaded in strict dependency order. src/95-ffmpeg.sh carries the long version of this.
       - name: configure and build
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/dav1d-out/lib/pkgconfig
         run: |
           cd src
           ./configure \
@@ -95,6 +139,7 @@ jobs:
             --disable-autodetect \
             --enable-videotoolbox --enable-audiotoolbox --enable-avfoundation \
             --enable-zlib --enable-bzlib \
+            --enable-libdav1d \
             --install-name-dir='@loader_path' \
             --extra-cflags="-mmacosx-version-min=${{ inputs.macos_min }}" \
             --extra-ldflags="-mmacosx-version-min=${{ inputs.macos_min }}" 2>&1 | tee configure.out
@@ -126,12 +171,17 @@ jobs:
           # libavcodec ends up referencing _iconv/_iconv_open/_iconv_close with nothing providing
           # them and the link fails. It only serves subtitle charset conversion, which neither
           # consumer uses, so it is dropped rather than patched with --extra-libs.
-          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(avfoundation|zlib|bzlib)$' || true)
+          # libdav1d is the one non-system entry, and it is static (see the dav1d step).
+          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(avfoundation|zlib|bzlib|libdav1d)$' || true)
           if [ -n "$unexpected" ]; then
               echo "::error::configure linked external libraries beyond the expected system set, so this kit would only load on a machine that has them:"
               printf '%s\n' "$unexpected"
               exit 1
           fi
+          printf '%s\n' "$externals" | grep -qx libdav1d || {
+              echo "::error::libdav1d is not among the linked external libraries"
+              exit 1
+          }
           make -j"$(sysctl -n hw.ncpu)"
           make install
 
@@ -236,8 +286,10 @@ jobs:
       # executes it. Loads the whole set by absolute path with nothing preloaded and the most
       # dependent library FIRST, then asks libavdevice whether avfoundation is registered -- the
       # capability a webcam or display-capture source needs. Opening a device is not possible here
-      # (a hosted runner has no camera), so registration is as far as this can honestly go.
-      - name: load the kit and confirm avfoundation registers
+      # (a hosted runner has no camera), so registration is as far as this can honestly go. Then
+      # does the same for the libdav1d AV1 decoder, which also proves the static archive's code
+      # really is inside libavcodec rather than referenced from somewhere else.
+      - name: load the kit and confirm avfoundation and libdav1d register
         run: |
           cat > probe.c <<'EOF'
           #include <stdio.h>
@@ -255,10 +307,16 @@ jobs:
               const void *f = NULL;
               while ((f = next(f))) {
                   const char *n = *(const char *const *)f;
-                  if (n && !strcmp(n, "avfoundation")) { printf("avfoundation registered\n"); return 0; }
+                  if (n && !strcmp(n, "avfoundation")) break;
               }
-              fprintf(stderr, "avfoundation not registered\n");
-              return 3;
+              if (!f) { fprintf(stderr, "avfoundation not registered\n"); return 3; }
+              printf("avfoundation registered\n");
+              // libavcodec is already loaded as libavdevice's dependency, so RTLD_DEFAULT finds it.
+              const void *(*find)(const char *) = dlsym(RTLD_DEFAULT, "avcodec_find_decoder_by_name");
+              if (!find) { fprintf(stderr, "dlsym avcodec_find_decoder_by_name failed\n"); return 2; }
+              if (!find("libdav1d")) { fprintf(stderr, "libdav1d decoder not registered\n"); return 4; }
+              printf("libdav1d registered\n");
+              return 0;
           }
           EOF
           clang -O1 -o probe probe.c
@@ -275,6 +333,7 @@ jobs:
           cp -a out/include "$name/include"
           rm -rf "$name/lib/pkgconfig"
           cp src/COPYING.LGPLv2.1 "$name/"
+          cp dav1d-src/COPYING "$name/COPYING.dav1d"
           tar -cJf "$name.tar.xz" "$name"
           shasum -a 256 "$name.tar.xz" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "KIT=$name.tar.xz" >> "$GITHUB_ENV"
