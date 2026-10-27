@@ -2,9 +2,11 @@
 # existing release. Separate from build.yml on purpose, and deliberately NOT built with
 # build-ffmpeg:
 #
-#   - It has to be FFmpeg 7.1.x. Sdcb.FFmpeg 7.0.0 (the ABI pin on the consuming side) resolves
-#     its DllImports against libavutil.59/libavcodec.61/libavformat.61/libavdevice.61 and cannot
-#     bind to anything else. build-ffmpeg builds its own pinned FFMPEG_VERSION, which is 9.x.
+#   - Its FFmpeg generation is set by the consuming binding, not by build-ffmpeg's own pin: the
+#     binding resolves exact SONAMEs and cannot bind to anything else. 7.1.x serves Sdcb.FFmpeg
+#     7.0.0 (libavutil.59, libavcodec.61, ...); 9.0.x serves FFmpeg.AutoGen 9.0.1 (libavutil.61,
+#     libavcodec.63, ...). The "fetch and verify" step holds the SONAME table for each supported
+#     line, and every later check reads it from there.
 #   - It wants one third-party library and no more. The consumer needs decode plus the
 #     avfoundation input device, not ~70 codecs, so the build takes minutes instead of an hour.
 #     The one exception is dav1d (BSD-2-Clause), because FFmpeg 7.1 has no native AV1 software
@@ -29,17 +31,17 @@ on:
   workflow_dispatch:
     inputs:
       ffmpeg_version:
-        description: FFmpeg release to build (must be 7.1.x for Sdcb.FFmpeg 7.0.0)
+        description: FFmpeg release to build (7.1.x for Sdcb.FFmpeg 7.0.0, 9.0.x for FFmpeg.AutoGen 9.0.1)
         required: true
-        default: "7.1.4"
+        default: "9.0.2"
       sha256:
         description: sha256 of ffmpeg-<version>.tar.xz (ffmpeg.org publishes no checksum file)
         required: true
-        default: "71f4aac3573ed9060489cb62526a6c7dda815ae10993789611acd7be9fa9fbf4"
+        default: "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
       release_tag:
         description: existing release tag to upload the kit to
         required: true
-        default: "btbn-mirror-n7.1.4"
+        default: "btbn-mirror-n9.0.2"
       dav1d_version:
         description: dav1d release linked statically into libavcodec for AV1 software decode
         required: true
@@ -110,13 +112,23 @@ jobs:
       - name: fetch and verify the FFmpeg source
         run: |
           ver='${{ inputs.ffmpeg_version }}'
+          # The library majors each supported line produces, which are what the consuming binding
+          # binds to. A new line needs its row added here, read from the lib*/version_major.h
+          # headers of its source, before anything else can check it.
           case "$ver" in
-          7.1.*) ;;
+          7.1.*) majors="avutil=59 swresample=5 swscale=8 avcodec=61 avformat=61 avfilter=10 avdevice=61" ;;
+          9.0.*) majors="avutil=61 swresample=7 swscale=10 avcodec=63 avformat=63 avfilter=12 avdevice=63" ;;
           *)
-              echo "::error::$ver is not 7.1.x; Sdcb.FFmpeg 7.0.0 cannot bind to another generation"
+              echo "::error::no SONAME table for $ver; add its row to this step"
               exit 1
               ;;
           esac
+          sonames=""
+          for pair in $majors; do
+              sonames="$sonames lib${pair%%=*}.${pair#*=}"
+              echo "SONAME_${pair%%=*}=lib${pair%%=*}.${pair#*=}" >> "$GITHUB_ENV"
+          done
+          echo "SONAMES=${sonames# }" >> "$GITHUB_ENV"
           curl --fail -L --retry 6 --retry-all-errors --connect-timeout 30 \
             "https://ffmpeg.org/releases/ffmpeg-$ver.tar.xz" -o ffmpeg.tar.xz
           echo '${{ inputs.sha256 }}  ffmpeg.tar.xz' > ffmpeg.tar.xz.sha256
@@ -189,8 +201,8 @@ jobs:
           # reference as @loader_path/... exactly as configure wrote it.
           #
           # --install-name-dir sets both, and the id it produces (@loader_path/libavutil.59.dylib)
-          # makes the kit unloadable by its real consumer. .NET reaches these through
-          # [DllImport("libavutil.59.dylib")], which is a bare-name dlopen, and dyld matches a
+          # makes the kit unloadable by its real consumer. .NET reaches these through a bare-name
+          # dlopen (Sdcb's [DllImport("libavutil.59.dylib")]), and dyld matches a
           # bare name against an already-loaded image ONLY by that image's install name -- never
           # by the path it was loaded from. So the consumer's preload of every library by
           # absolute path succeeds, logs nothing, and then every call fails with
@@ -215,15 +227,14 @@ jobs:
         run: |
           lib=out/lib
           fail=0
-          for soname in libavutil.59 libswresample.5 libswscale.8 libavcodec.61 \
-            libavformat.61 libavfilter.10 libavdevice.61; do
+          for soname in $SONAMES; do
               if [ ! -e "$lib/$soname.dylib" ]; then
                   echo "::error::missing $soname.dylib"
                   fail=1
               fi
           done
 
-          arch=$(lipo -info "$lib/libavcodec.61.dylib" | sed 's/.*: //')
+          arch=$(lipo -info "$lib/$SONAME_avcodec.dylib" | sed 's/.*: //')
           [ "$arch" = "${{ matrix.arch }}" ] || { echo "::error::built $arch, expected ${{ matrix.arch }}"; fail=1; }
 
           # The floor is the builder's own OS version unless it was passed explicitly, and that
@@ -270,7 +281,7 @@ jobs:
 
           # Dumped to a file first: `strings | grep -m1` has grep close the pipe on its match,
           # which SIGPIPEs strings, and under pipefail that reads as failure.
-          strings "$lib"/libavutil.59*.dylib > avutil.strings
+          strings "$lib/$SONAME_avutil.dylib" > avutil.strings
           cfg=$(grep -m1 -- '--enable-shared' avutil.strings || true)
           case "$cfg" in
           *--enable-gpl* | *--enable-nonfree*)
@@ -297,7 +308,7 @@ jobs:
           #include <dlfcn.h>
           int main(int argc, char **argv) {
               char path[2048];
-              snprintf(path, sizeof path, "%s/libavdevice.61.dylib", argv[1]);
+              snprintf(path, sizeof path, "%s/%s.dylib", argv[1], argv[2]);
               void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
               if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
               void (*reg)(void) = dlsym(h, "avdevice_register_all");
@@ -320,7 +331,7 @@ jobs:
           }
           EOF
           clang -O1 -o probe probe.c
-          ./probe "$PWD/out/lib"
+          ./probe "$PWD/out/lib" "$SONAME_avdevice"
 
       - name: package the kit
         run: |
