@@ -120,6 +120,26 @@ jobs:
       - name: install build dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
+          # An end-of-life Debian leaves deb.debian.org for archive.debian.org, and the way that
+          # presents is worth knowing because it is not a clean failure: the indexes still resolve
+          # on deb.debian.org, so `apt-get update` succeeds, and then every individual package
+          # 404s out of the pool mid-download. bullseye's LTS ended in August 2026 and it is
+          # already in that state. Check-Valid-Until is off because an archived InRelease is
+          # expired by definition.
+          #
+          # Keyed off the image's own codename rather than hardcoded, so moving build_image to a
+          # supported release needs no change here and moving it to another EOL one keeps working.
+          . /etc/os-release
+          case "$VERSION_CODENAME" in
+          buster | bullseye)
+              # printf rather than a heredoc: a heredoc body inside this YAML block scalar would
+              # carry the block's own indentation into sources.list.
+              printf 'deb http://archive.debian.org/debian %s main\ndeb http://archive.debian.org/debian-security %s-security main\n' \
+                "$VERSION_CODENAME" "$VERSION_CODENAME" > /etc/apt/sources.list
+              echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
+              echo "$VERSION_CODENAME is EOL; using archive.debian.org"
+              ;;
+          esac
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential nasm pkg-config git curl ca-certificates xz-utils \
