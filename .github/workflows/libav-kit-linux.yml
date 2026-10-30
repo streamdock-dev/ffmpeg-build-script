@@ -1,0 +1,463 @@
+# Builds the Linux libav *shared dev kit* that StreamDock loads in-process. Sibling of
+# libav-kit.yml, which does the same job for macOS; kept separate because every verification step
+# differs in tooling (readelf/objdump/patchelf rather than otool/vtool/install_name_tool) and
+# putting both in one matrix would make each step a pair of mutually exclusive branches.
+#
+# WHY THIS EXISTS AT ALL, given that BtbN publishes Linux builds and we have been mirroring them:
+# BtbN's kits hard-require a libva symbol that mainstream LTS distributions do not have, and the
+# failure is a process abort rather than an error.
+#
+#   - FFmpeg 9.0 switched libavutil's VAAPI image mapping to vaMapBuffer2 (ffmpeg-devel, Apr 2024),
+#     behind `#if VA_CHECK_VERSION(1, 21, 0)` in libavutil/hwcontext_vaapi.c. That guard is
+#     resolved at COMPILE time, so which call ends up in the binary is decided by the build host's
+#     libva headers, not by anything at runtime. The #else arm calls plain vaMapBuffer.
+#   - BtbN builds against libva >= 2.21, so the vaMapBuffer2 arm is baked in. Ubuntu 24.04 LTS
+#     ships libva 2.20.0 and has nothing newer in its repositories, so that symbol is simply
+#     absent on a very large share of target machines.
+#   - BtbN wraps libva in implib-gen stubs that dlopen it lazily. A missing symbol there is not an
+#     error return -- the generated resolver reaches `assert(0 && "Assertion in generated code")`
+#     and SIGABRTs the host process. Measured on Alder Lake-N / Ubuntu 24.04: software decode
+#     exits 0, the same decode with `-hwaccel vaapi` exits 134.
+#   - The FFmpeg source comment at that call ("On drivers not implementing vaMapBuffer2 libva calls
+#     vaMapBuffer instead") describes a DRIVER-level fallback inside libva. It does not help when
+#     libva itself is too old to export the entry point.
+#
+# Building it ourselves against an OLD libva is the whole fix, and it is strictly more compatible
+# rather than a trade: with libva 2.20 headers the guard compiles the vaMapBuffer2 arm out, the
+# binary references only vaMapBuffer, and the result runs on old and new libva alike. The feature
+# given up is a write-only-mapping optimisation hint, which no StreamDock path uses. Verified on
+# the same machine that reproduces the abort: FFmpeg 9.0.2 built this way does VAAPI hardware
+# decode into h264_vaapi encode, while BtbN's 9.0.2 aborts.
+#
+# The same "build against the oldest thing you support" rule is why `build_image` is a Debian
+# container rather than the bare runner image, and it is load-bearing in the other direction too:
+# the runner's own glibc is 2.39, BtbN's kits need only 2.28, so building on the bare runner would
+# fix VAAPI and break every distribution older than Ubuntu 24.04. One choice of base image sets
+# both floors, and the verify step asserts the glibc one so it cannot drift silently.
+#
+# Triggered by hand, like its macOS sibling: the output is a pinned artifact that changes only
+# when the FFmpeg generation does.
+#
+# See StreamDock's Docs/Reference/ThirdParty/ffmpeg-lgpl-fork-status.md and
+# Docs/ffmpeg-autogen-migration-plan.md.
+name: libav kit (Linux, shared)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: FFmpeg release to build (9.0.x for FFmpeg.AutoGen 9.0.1)
+        required: true
+        default: "9.0.2"
+      sha256:
+        description: sha256 of ffmpeg-<version>.tar.xz (ffmpeg.org publishes no checksum file)
+        required: true
+        default: "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e"
+      release_tag:
+        description: existing release tag to upload the kit to
+        required: true
+        default: "btbn-mirror-n9.0.2"
+      dav1d_version:
+        description: dav1d release linked statically into libavcodec for AV1 software decode
+        required: true
+        default: "1.5.4"
+      dav1d_sha256:
+        description: sha256 of dav1d-<version>.tar.xz (as published alongside it on videolan.org)
+        required: true
+        default: "686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5"
+      nv_codec_headers_version:
+        description: nv-codec-headers tag supplying the NVDEC/NVENC headers (header-only, dlopened at runtime)
+        required: true
+        default: "n13.0.19.0"
+      build_image:
+        description: >-
+          container the kit is built in. Sets both the glibc floor and the libva version the
+          vaMapBuffer2 guard is resolved against, so older is more compatible. debian:11 is
+          glibc 2.31 / libva 2.10, which covers Ubuntu 22.04+, Debian 11+ and RHEL 9+.
+        required: true
+        default: "debian:11"
+      glibc_max:
+        description: highest glibc symbol version any shipped library may reference; must match build_image
+        required: true
+        default: "2.31"
+      dry_run:
+        description: >-
+          build, verify and load-test the kit but keep it off the release, leaving it as a
+          workflow artifact instead. Use it for the first run after changing anything here: a
+          release asset is pinned by StreamDock's CI, so publishing one is not a step to take
+          before the build has been seen to pass.
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  libav-kit-linux:
+    name: libav kit (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container: ${{ inputs.build_image }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      # The container is a bare Debian, so everything the build needs comes from here. Notable
+      # entries, since the rest are obvious:
+      #   - nasm: FFmpeg's x86 assembly. Not needed on aarch64, but installed unconditionally
+      #     because the failure when it is missing is misleading -- configure stops at "nasm/yasm
+      #     not found or too old", and because it stops, the LGPL licence line the next step greps
+      #     for never appears either, so a missing assembler reads as a licensing problem.
+      #   - libva-dev: the point of this workflow. Its version is the container's, and that is
+      #     what decides the vaMapBuffer2 guard.
+      #   - libbz2-dev / zlib1g-dev: both are re-enabled explicitly on top of --disable-autodetect
+      #     (see the configure step), so their headers must be present or configure fails.
+      #   - meson/ninja: dav1d's build system.
+      - name: install build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential nasm pkg-config git curl ca-certificates xz-utils \
+            libva-dev libbz2-dev zlib1g-dev \
+            meson ninja-build python3 patchelf binutils
+          echo "libva-dev: $(dpkg-query -W -f='${Version}' libva-dev)"
+          echo "glibc: $(getconf GNU_LIBC_VERSION)"
+
+      # Recorded in the log and the summary because it is the single fact this whole workflow
+      # turns on: a kit built against a libva that HAS vaMapBuffer2 would reintroduce the abort
+      # this exists to avoid. The verify step checks the built artifact rather than trusting this,
+      # but a mismatch is far easier to understand named here.
+      - name: record the libva the guard will be resolved against
+        run: |
+          libva_ver=$(pkg-config --modversion libva)
+          echo "libva $libva_ver in ${{ inputs.build_image }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -n "$(grep -rl vaMapBuffer2 /usr/include/va/ 2>/dev/null)" ]; then
+              echo "::warning::this libva declares vaMapBuffer2, so the kit will reference it and will abort on hosts with libva < 2.21; use an older build_image unless that is intended"
+          else
+              echo "this libva does not declare vaMapBuffer2, so the guard compiles to plain vaMapBuffer"
+          fi
+
+      # Static and position-independent so it links into libavcodec.so and the kit gains no
+      # shared object to ship. Same reasoning as the macOS leg: FFmpeg's native AV1 decoder is
+      # hwaccel-only, so without dav1d a machine whose GPU cannot decode AV1 plays nothing from
+      # an AV1 file.
+      - name: build dav1d (static, for AV1 decode)
+        run: |
+          ver='${{ inputs.dav1d_version }}'
+          curl --fail -L --retry 6 --retry-all-errors --connect-timeout 30 \
+            "https://downloads.videolan.org/pub/videolan/dav1d/$ver/dav1d-$ver.tar.xz" -o dav1d.tar.xz
+          echo '${{ inputs.dav1d_sha256 }}  dav1d.tar.xz' > dav1d.tar.xz.sha256
+          sha256sum -c dav1d.tar.xz.sha256
+          mkdir -p dav1d-src
+          tar -xJf dav1d.tar.xz -C dav1d-src --strip-components=1
+          meson setup dav1d-src/build dav1d-src \
+            --prefix="$PWD/dav1d-out" --libdir=lib \
+            --buildtype=release --default-library=static -Db_staticpic=true \
+            -Denable_tools=false -Denable_tests=false -Denable_examples=false
+          ninja -C dav1d-src/build install
+          # A shared libdav1d beside the archive would be preferred by the linker and become a
+          # dependency the kit does not ship; the relocatability check would catch it, this names
+          # it sooner.
+          if ls dav1d-out/lib/libdav1d*.so* >/dev/null 2>&1; then
+              echo "::error::dav1d produced a shared object; it must be static only"
+              exit 1
+          fi
+
+      # Headers only -- no NVIDIA library is linked or shipped. FFmpeg resolves the CUDA/NVDEC
+      # entry points by dlopen at runtime, so a machine with no NVIDIA driver simply reports no
+      # CUDA device and falls back, exactly as it does today with BtbN's kit.
+      - name: fetch the NVDEC/NVENC headers
+        run: |
+          ver='${{ inputs.nv_codec_headers_version }}'
+          git clone --depth 1 --branch "$ver" \
+            https://github.com/FFmpeg/nv-codec-headers.git nv-codec-headers
+          make -C nv-codec-headers PREFIX="$PWD/nv-out" install
+
+      - name: fetch and verify the FFmpeg source
+        run: |
+          ver='${{ inputs.ffmpeg_version }}'
+          # The library majors each supported line produces, which are what the consuming binding
+          # binds to. Kept identical to libav-kit.yml's table on purpose: both kits serve the same
+          # binding and must agree. A new line needs its row added here, read from the source's
+          # lib*/version_major.h headers, before anything else can check it.
+          case "$ver" in
+          7.1.*) majors="avutil=59 swresample=5 swscale=8 avcodec=61 avformat=61 avfilter=10 avdevice=61" ;;
+          9.0.*) majors="avutil=61 swresample=7 swscale=10 avcodec=63 avformat=63 avfilter=12 avdevice=63" ;;
+          *)
+              echo "::error::no SONAME table for $ver; add its row to this step"
+              exit 1
+              ;;
+          esac
+          sonames=""
+          for pair in $majors; do
+              sonames="$sonames lib${pair%%=*}.so.${pair#*=}"
+              echo "SONAME_${pair%%=*}=lib${pair%%=*}.so.${pair#*=}" >> "$GITHUB_ENV"
+          done
+          echo "SONAMES=${sonames# }" >> "$GITHUB_ENV"
+          curl --fail -L --retry 6 --retry-all-errors --connect-timeout 30 \
+            "https://ffmpeg.org/releases/ffmpeg-$ver.tar.xz" -o ffmpeg.tar.xz
+          echo '${{ inputs.sha256 }}  ffmpeg.tar.xz' > ffmpeg.tar.xz.sha256
+          sha256sum -c ffmpeg.tar.xz.sha256
+          mkdir -p src
+          tar -xJf ffmpeg.tar.xz -C src --strip-components=1
+
+      - name: configure and build
+        env:
+          PKG_CONFIG_PATH: ${{ github.workspace }}/dav1d-out/lib/pkgconfig:${{ github.workspace }}/nv-out/lib/pkgconfig
+        run: |
+          cd src
+          ./configure \
+            --prefix="$PWD/../out" \
+            --enable-shared --disable-static \
+            --disable-programs --disable-doc \
+            --disable-autodetect \
+            --enable-vaapi --disable-xlib \
+            --enable-ffnvcodec --enable-nvdec --enable-nvenc --enable-cuda --enable-cuvid \
+            --enable-zlib --enable-bzlib \
+            --enable-libdav1d 2>&1 | tee configure.out
+          # configure prints this on stdout and records it nowhere else, so it is captured above
+          # and grepped from the file -- checked before the build so a licensing surprise costs
+          # seconds instead of minutes.
+          grep -q '^License: LGPL' configure.out || {
+              echo "::error::configure did not report an LGPL license:"
+              grep -i '^License' configure.out || true
+              exit 1
+          }
+          # The three capabilities the Linux consumer actually needs, asserted by name rather than
+          # inferred from the build succeeding. VAAPI and NVDEC are hwaccels, not external
+          # libraries, so they do not appear in the externals list checked below.
+          for sym in VAAPI NVDEC CUDA; do
+              grep -q "^#define CONFIG_$sym 1$" ffbuild/config.h || {
+                  echo "::error::CONFIG_$sym is not enabled"
+                  exit 1
+              }
+          done
+          # v4l2 is the webcam input device. It survives --disable-autodetect (it is gated on a
+          # kernel header, not a pkg-config probe), but it is the one capability here whose loss
+          # would be silent and would not show up until a user opened a camera.
+          awk '/^Enabled indevs:/ { g = 1; next } /^Enabled outdevs/ { g = 0 } g' configure.out \
+            | tr ' ' '\n' | grep -qx v4l2 || {
+              echo "::error::v4l2 is not among the enabled input devices"
+              exit 1
+          }
+          # Assert WHICH external libraries got linked, not just that the build succeeded. The
+          # relocatability check below only catches a dependency that resolves outside the
+          # allowlist, and only after a full build; this names the cause immediately. It also
+          # catches --disable-autodetect silently not applying, which is how the first hand-built
+          # macOS kit acquired Homebrew's sdl2.
+          #
+          # iconv is in the list because glibc provides it in libc itself, so unlike on macOS
+          # there is no -liconv to leak and nothing to disable; libdav1d is the one non-system
+          # entry and it is static.
+          externals=$(awk '/^External libraries:/ { grab = 1; next } /^External libraries providing/ { grab = 0 } grab && NF { for (i = 1; i <= NF; i++) print $i }' configure.out | sort -u)
+          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(iconv|zlib|bzlib|libdav1d|ffnvcodec)$' || true)
+          if [ -n "$unexpected" ]; then
+              echo "::error::configure linked external libraries beyond the expected set, so this kit would only load on a machine that has them:"
+              printf '%s\n' "$unexpected"
+              exit 1
+          fi
+          printf '%s\n' "$externals" | grep -qx libdav1d || {
+              echo "::error::libdav1d is not among the linked external libraries"
+              exit 1
+          }
+          make -j"$(nproc)"
+          make install
+
+          # $ORIGIN, so each library finds its siblings next to itself wherever the kit is
+          # unpacked. Set with patchelf afterwards rather than through --extra-ldflags, which
+          # cannot carry it reliably: the literal the linker needs is $ORIGIN, and that string has
+          # to survive this shell, configure's own eval of extra-ldflags, and make's variable
+          # expansion. Measured what the obvious spelling actually produces -- writing
+          # '\$\$ORIGIN' here lands `-Wl,-rpath,'1127144ORIGIN'` in config.mak, the shell's PID,
+          # because configure re-evals the flag. patchelf takes the string exactly as given.
+          for so in ../out/lib/*.so.*; do
+              [ -L "$so" ] && continue
+              patchelf --set-rpath '$ORIGIN' "$so"
+          done
+
+      # Everything the consumer depends on, checked on the architecture that will run it.
+      - name: verify the kit
+        run: |
+          lib=out/lib
+          fail=0
+          for soname in $SONAMES; do
+              if [ ! -e "$lib/$soname" ]; then
+                  echo "::error::missing $soname"
+                  fail=1
+              fi
+          done
+
+          arch=$(readelf -h "$lib/$SONAME_avcodec" | awk '/Machine:/ { $1 = ""; sub(/^ +/, ""); print }')
+          case "${{ matrix.arch }}:$arch" in
+          x86_64:*X86-64* | aarch64:*AArch64*) ;;
+          *) echo "::error::built for '$arch', expected ${{ matrix.arch }}"; fail=1 ;;
+          esac
+
+          # THE regression guard for the reason this workflow exists. A kit that references
+          # vaMapBuffer2 aborts the host process on any libva older than 2.21, and every other
+          # check here would still pass. Covers both shapes it could arrive in: a real dynamic
+          # import, and an implib-style trampoline that only ever appears as a string.
+          for so in "$lib"/*.so.*; do
+              [ -L "$so" ] && continue
+              if objdump -T "$so" 2>/dev/null | grep -q vaMapBuffer2; then
+                  echo "::error::$(basename "$so") imports vaMapBuffer2; it was built against libva >= 2.21 and will abort on hosts with an older libva"
+                  fail=1
+              fi
+              if strings "$so" | grep -qx vaMapBuffer2; then
+                  echo "::error::$(basename "$so") names vaMapBuffer2; see this workflow's header comment"
+                  fail=1
+              fi
+          done
+          objdump -T "$lib/$SONAME_avutil" | grep -q vaMapBuffer || {
+              echo "::error::$SONAME_avutil does not import vaMapBuffer at all, so VAAPI surface mapping cannot work"
+              fail=1
+          }
+
+          # The glibc floor. Invisible on the machine that produces the kit, which is exactly why
+          # it is asserted: the runner's own glibc is far newer than the container's, and a
+          # misconfigured container would quietly raise the floor for every user.
+          max='${{ inputs.glibc_max }}'
+          for so in "$lib"/*.so.*; do
+              [ -L "$so" ] && continue
+              highest=$(objdump -T "$so" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | sed 's/GLIBC_//' | sort -uV | tail -1)
+              [ -n "$highest" ] || continue
+              if [ "$(printf '%s\n%s\n' "$max" "$highest" | sort -V | tail -1)" != "$max" ]; then
+                  echo "::error::$(basename "$so") needs glibc $highest, above the $max floor"
+                  fail=1
+              fi
+          done
+
+          # Every dependency must either be in the kit, be resolved through $ORIGIN, or be on the
+          # allowlist of things present on any glibc Linux with a VAAPI stack. libva/libva-drm are
+          # a deliberate runtime requirement rather than a leak -- see the header comment -- and
+          # are named here so adding a different one is a decision rather than an accident.
+          for so in "$lib"/*.so.*; do
+              [ -L "$so" ] && continue
+              leaked=$(objdump -p "$so" | awk '/NEEDED/ { print $2 }' \
+                | grep -vE '^lib(avutil|avcodec|avformat|avfilter|avdevice|swscale|swresample)\.so\.' \
+                | grep -vE '^lib(c|m|dl|pthread|rt|gcc_s|stdc\+\+|z|bz2|va|va-drm)\.so\.' || true)
+              if [ -n "$leaked" ]; then
+                  echo "::error::$(basename "$so") depends on libraries outside the allowlist:"
+                  printf '%s\n' "$leaked"
+                  fail=1
+              fi
+              # $ORIGIN, not an absolute build path: the kit has to be relocatable.
+              rpath=$(objdump -p "$so" | awk '/R(UN)?PATH/ { print $2 }' | tr '\n' ' ')
+              case "$rpath" in
+              *'$ORIGIN'*) ;;
+              *) echo "::error::$(basename "$so") has rpath '$rpath', expected it to contain \$ORIGIN"; fail=1 ;;
+              esac
+          done
+
+          # Dumped to a file first: `strings | grep -m1` has grep close the pipe on its match,
+          # which SIGPIPEs strings, and under pipefail that reads as failure.
+          strings "$lib/$SONAME_avutil" > avutil.strings
+          cfg=$(grep -m1 -- '--enable-shared' avutil.strings || true)
+          case "$cfg" in
+          *--enable-gpl* | *--enable-nonfree*)
+              echo "::error::GPL or non-free flags present: $cfg"
+              fail=1
+              ;;
+          esac
+
+          [ "$fail" -eq 0 ] || exit 1
+          echo "static checks passed for ${{ matrix.arch }}"
+
+      # The reason each slice is built on its own runner rather than cross-compiled: this executes
+      # it. Loads the set by absolute path with nothing preloaded and the most dependent library
+      # first, then asks for the three things the consumer needs and that static analysis cannot
+      # confirm: that v4l2 is registered, that the static dav1d really is inside libavcodec, and
+      # that libavutil can create a VAAPI device type. Creating an actual VAAPI device is not
+      # possible here -- a hosted runner has no GPU -- so type lookup is as far as this can
+      # honestly go, and the real hardware check happens in StreamDock's own suites.
+      - name: load the kit and confirm v4l2, libdav1d and the VAAPI device type
+        run: |
+          cat > probe.c <<'EOF'
+          #include <stdio.h>
+          #include <string.h>
+          #include <dlfcn.h>
+          int main(int argc, char **argv) {
+              char path[2048];
+              snprintf(path, sizeof path, "%s/%s", argv[1], argv[2]);
+              void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+              if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+              void (*reg)(void) = dlsym(h, "avdevice_register_all");
+              const void *(*next)(const void *) = dlsym(h, "av_input_video_device_next");
+              if (!reg || !next) { fprintf(stderr, "dlsym failed\n"); return 2; }
+              reg();
+              const void *f = NULL;
+              while ((f = next(f))) {
+                  const char *n = *(const char *const *)f;
+                  if (n && !strcmp(n, "v4l2")) break;
+              }
+              if (!f) { fprintf(stderr, "v4l2 not registered\n"); return 3; }
+              printf("v4l2 registered\n");
+              // libavcodec and libavutil are already loaded as libavdevice's dependencies, so
+              // RTLD_DEFAULT finds them.
+              const void *(*find)(const char *) = dlsym(RTLD_DEFAULT, "avcodec_find_decoder_by_name");
+              if (!find) { fprintf(stderr, "dlsym avcodec_find_decoder_by_name failed\n"); return 2; }
+              if (!find("libdav1d")) { fprintf(stderr, "libdav1d decoder not registered\n"); return 4; }
+              printf("libdav1d registered\n");
+              int (*type_from_name)(const char *) = dlsym(RTLD_DEFAULT, "av_hwdevice_find_type_by_name");
+              if (!type_from_name) { fprintf(stderr, "dlsym av_hwdevice_find_type_by_name failed\n"); return 2; }
+              if (type_from_name("vaapi") == 0) { fprintf(stderr, "vaapi is not a known hwdevice type\n"); return 5; }
+              printf("vaapi hwdevice type present\n");
+              return 0;
+          }
+          EOF
+          gcc -O1 -o probe probe.c -ldl
+          ./probe "$PWD/out/lib" "$SONAME_avdevice"
+
+      - name: package the kit
+        run: |
+          ver='${{ inputs.ffmpeg_version }}'
+          name="ffmpeg-n$ver-linux-${{ matrix.arch }}-lgpl-shared-${ver%.*}"
+          mkdir -p "$name"
+          # -a keeps the symlink farm: the loader resolves a dependency through whichever recorded
+          # name it finds, and dereferencing multiplies the size for no gain.
+          cp -a out/lib "$name/lib"
+          cp -a out/include "$name/include"
+          rm -rf "$name/lib/pkgconfig"
+          cp src/COPYING.LGPLv2.1 "$name/"
+          cp dav1d-src/COPYING "$name/COPYING.dav1d"
+          tar -cJf "$name.tar.xz" "$name"
+          sha256sum "$name.tar.xz" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "KIT=$name.tar.xz" >> "$GITHUB_ENV"
+
+      - name: keep the kit as a workflow artifact (dry run)
+        if: inputs.dry_run
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KIT }}
+          path: ${{ env.KIT }}
+          retention-days: 7
+          if-no-files-found: error
+
+      # The container has no gh, and installing it to upload one file is more moving parts than
+      # the REST call it would wrap.
+      - name: upload to the release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(curl --fail -sS -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ inputs.release_tag }}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          # --clobber has no equivalent here, so an existing asset of the same name is removed
+          # first; re-running the workflow for the same tag has to be idempotent.
+          existing=$(curl --fail -sS -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/$id/assets" \
+            | python3 -c 'import json,sys,os; print(next((str(a["id"]) for a in json.load(sys.stdin) if a["name"] == os.environ["KIT"]), ""))')
+          if [ -n "$existing" ]; then
+              curl --fail -sS -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+                "https://api.github.com/repos/${{ github.repository }}/releases/assets/$existing"
+          fi
+          curl --fail -sS -X POST -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/x-xz" \
+            --data-binary "@$KIT" \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/$id/assets?name=$KIT"
