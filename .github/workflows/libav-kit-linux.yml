@@ -423,6 +423,10 @@ jobs:
       - name: load the kit and confirm v4l2, libdav1d and the VAAPI device type
         run: |
           cat > probe.c <<'EOF'
+          // RTLD_DEFAULT is a GNU extension and glibc's dlfcn.h hides it without this, so the
+          // macOS sibling's probe does not need it -- Darwin declares it unconditionally. Must
+          // precede every include.
+          #define _GNU_SOURCE
           #include <stdio.h>
           #include <string.h>
           #include <dlfcn.h>
@@ -437,8 +441,12 @@ jobs:
               reg();
               const void *f = NULL;
               while ((f = next(f))) {
+                  // strstr, not strcmp: an AVInputFormat's name can be a comma-separated alias
+                  // list, and this one is "video4linux2,v4l2". configure's own component list
+                  // spells it plainly as v4l2, which is what makes the exact-match check in the
+                  // configure step correct and this one wrong.
                   const char *n = *(const char *const *)f;
-                  if (n && !strcmp(n, "v4l2")) break;
+                  if (n && strstr(n, "v4l2")) break;
               }
               if (!f) { fprintf(stderr, "v4l2 not registered\n"); return 3; }
               printf("v4l2 registered\n");
