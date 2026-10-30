@@ -197,6 +197,20 @@ jobs:
           git clone --depth 1 --branch "$ver" \
             https://github.com/FFmpeg/nv-codec-headers.git nv-codec-headers
           make -C nv-codec-headers PREFIX="$PWD/nv-out" install
+          # Built here rather than in the next step's `env:` because ${{ github.workspace }}
+          # expands to the RUNNER's path (/home/runner/work/...) even for a step running inside a
+          # container, which sees the same directory as /__w/... . Pointing PKG_CONFIG_PATH at the
+          # host spelling silently finds nothing, and configure then fails with "cuda requested,
+          # but not all dependencies are satisfied: ffnvcodec" -- a message that reads like a flag
+          # problem rather than a path one. $PWD is the container's view and is what both
+          # prefixes were installed under.
+          echo "PKG_CONFIG_PATH=$PWD/dav1d-out/lib/pkgconfig:$PWD/nv-out/lib/pkgconfig" >> "$GITHUB_ENV"
+          # Asserted here, where the cause is still obvious, rather than left to configure.
+          PKG_CONFIG_PATH="$PWD/dav1d-out/lib/pkgconfig:$PWD/nv-out/lib/pkgconfig" \
+            pkg-config --modversion ffnvcodec dav1d || {
+              echo "::error::ffnvcodec and/or dav1d are not visible to pkg-config under $PWD"
+              exit 1
+          }
 
       - name: fetch and verify the FFmpeg source
         run: |
@@ -226,9 +240,9 @@ jobs:
           mkdir -p src
           tar -xJf ffmpeg.tar.xz -C src --strip-components=1
 
+      # PKG_CONFIG_PATH comes from the previous step through GITHUB_ENV; see the note there for
+      # why it is not set as this step's `env:`.
       - name: configure and build
-        env:
-          PKG_CONFIG_PATH: ${{ github.workspace }}/dav1d-out/lib/pkgconfig:${{ github.workspace }}/nv-out/lib/pkgconfig
         run: |
           cd src
           ./configure \
