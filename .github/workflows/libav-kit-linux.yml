@@ -197,8 +197,10 @@ jobs:
           git clone --depth 1 --branch "$ver" \
             https://github.com/FFmpeg/nv-codec-headers.git nv-codec-headers
           make -C nv-codec-headers PREFIX="$PWD/nv-out" install
-          # Built here rather than in the next step's `env:` because ${{ github.workspace }}
-          # expands to the RUNNER's path (/home/runner/work/...) even for a step running inside a
+          # Built here rather than in the next step's `env:` because the github.workspace
+          # expression (not written out, because Actions interpolates expressions inside a run
+          # block's comments too) expands to the RUNNER's path (/home/runner/work/...) even for a
+          # step running inside a
           # container, which sees the same directory as /__w/... . Pointing PKG_CONFIG_PATH at the
           # host spelling silently finds nothing, and configure then fails with "cuda requested,
           # but not all dependencies are satisfied: ffnvcodec" -- a message that reads like a flag
