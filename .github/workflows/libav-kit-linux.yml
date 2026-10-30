@@ -267,8 +267,17 @@ jobs:
           # The three capabilities the Linux consumer actually needs, asserted by name rather than
           # inferred from the build succeeding. VAAPI and NVDEC are hwaccels, not external
           # libraries, so they do not appear in the externals list checked below.
+          # config.h at the top level, NOT ffbuild/config.h -- configure writes its generated
+          # makefile fragments under ffbuild/ but leaves this one here. Checked for existence
+          # separately so a path mistake cannot read as a disabled feature: `grep -q` on a
+          # missing file exits non-zero exactly like a missing define, and the first version of
+          # this step reported "CONFIG_VAAPI is not enabled" for a build where it was enabled.
+          [ -f config.h ] || {
+              echo "::error::config.h is not where this step expects it; the feature checks below cannot be trusted"
+              exit 1
+          }
           for sym in VAAPI NVDEC CUDA; do
-              grep -q "^#define CONFIG_$sym 1$" ffbuild/config.h || {
+              grep -q "^#define CONFIG_$sym 1$" config.h || {
                   echo "::error::CONFIG_$sym is not enabled"
                   exit 1
               }
