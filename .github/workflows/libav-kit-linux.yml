@@ -431,11 +431,17 @@ jobs:
           # allowlist of things present on any glibc Linux with a VAAPI stack. libva/libva-drm are
           # a deliberate runtime requirement rather than a leak -- see the header comment -- and
           # are named here so adding a different one is a decision rather than an accident.
+          # ld-linux-*.so is the dynamic linker itself: harmless by construction (every ELF binary
+          # on the architecture already needs it just to load at all, static or not), and it shows
+          # up as an explicit NEEDED entry on aarch64 specifically because some of the static
+          # archives linked in (xcb and friends) carry IFUNC-resolved glibc routines, which ld
+          # satisfies through an explicit dependency on ld.so rather than leaving it implicit.
           for so in "$lib"/*.so.*; do
               [ -L "$so" ] && continue
               leaked=$(objdump -p "$so" | awk '/NEEDED/ { print $2 }' \
                 | grep -vE '^lib(avutil|avcodec|avformat|avfilter|avdevice|swscale|swresample)\.so\.' \
-                | grep -vE '^lib(c|m|dl|pthread|rt|gcc_s|stdc\+\+|z|bz2|va|va-drm)\.so\.' || true)
+                | grep -vE '^lib(c|m|dl|pthread|rt|gcc_s|stdc\+\+|z|bz2|va|va-drm)\.so\.' \
+                | grep -vE '^ld-linux-(x86-64|aarch64)\.so\.' || true)
               if [ -n "$leaked" ]; then
                   echo "::error::$(basename "$so") depends on libraries outside the allowlist:"
                   printf '%s\n' "$leaked"
