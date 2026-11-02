@@ -557,6 +557,16 @@ jobs:
 
       # The container has no gh, and installing it to upload one file is more moving parts than
       # the REST call it would wrap.
+      #
+      # After this replaces an existing asset of the same name, GitHub's own release-asset CDN
+      # can keep serving the old bytes from the releases/download/<tag>/<name> URL for a few
+      # minutes -- observed directly replacing this asset for the x11grab fix: a fetch by name a
+      # few minutes after the new upload still got the old Oct-30 tarball, while fetching by asset
+      # id got the new one immediately. A CI job that fetches this release right after a republish
+      # can race that cache. There is no cache-busting step here because there is nothing to add
+      # that would reliably beat it (a delay would just be a guess at the TTL) -- a consumer that
+      # cares should verify the download's checksum against this step's own sha256sum output
+      # (recorded in this run's step summary) rather than trust the fetch unconditionally.
       - name: upload to the release
         if: ${{ !inputs.dry_run }}
         env:
