@@ -148,6 +148,30 @@ jobs:
           echo "libva-dev: $(dpkg-query -W -f='${Version}' libva-dev)"
           echo "glibc: $(getconf GNU_LIBC_VERSION)"
 
+      # x11grab (libavdevice/xcbgrab.c) needs libxcb, plus xcb-shm/xcb-xfixes/xcb-shape for
+      # shared-memory capture speed, cursor shape and window-shape support. Dropped by accident
+      # when this workflow replaced BtbN's kit (StreamDock 60436cd4) -- nothing here ever enabled
+      # it, silently breaking Scene Studio's in-process Display/Window Capture and EditStream's
+      # desktop source on Linux (they open x11grab through this libav directly, with no CLI
+      # fallback, unlike RecorderService's recording path).
+      #
+      # Built statically, as BtbN does. Debian's xcb-shm/xfixes/shape packages are .a-only, but
+      # the core chain -- libxcb, libXau, libXdmcp, and xfixes's own libxcb-render dependency --
+      # ships both .a and .so, and a plain -lxcb prefers the .so. That would leave a real X11
+      # runtime dependency in libavdevice's NEEDED list, which is exactly backwards: a headless
+      # node with no X libraries installed still has to load this kit. Deleting the .so (not the
+      # .a) is simpler and more reliable than out-ordering pkg-config's own dynamic -lxcb on the
+      # link line through configure's extra-libs.
+      - name: install xcb and force it to link statically
+        run: |
+          apt-get install -y --no-install-recommends \
+            libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev libxcb-shape0-dev
+          multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
+          libdir="/usr/lib/$multiarch"
+          rm -f "$libdir"/libxcb.so* "$libdir"/libXau.so* "$libdir"/libXdmcp.so* "$libdir"/libxcb-render.so*
+          echo "remaining xcb/X11 libraries in $libdir (static archives only, no .so):"
+          ls "$libdir"/libxcb* "$libdir"/libX{au,dmcp}* 2>/dev/null
+
       # Recorded in the log and the summary because it is the single fact this whole workflow
       # turns on: a kit built against a libva that HAS vaMapBuffer2 would reintroduce the abort
       # this exists to avoid. The verify step checks the built artifact rather than trusting this,
@@ -255,7 +279,8 @@ jobs:
             --enable-vaapi --disable-xlib \
             --enable-ffnvcodec --enable-nvdec --enable-nvenc --enable-cuda --enable-cuvid \
             --enable-zlib --enable-bzlib \
-            --enable-libdav1d 2>&1 | tee configure.out
+            --enable-libdav1d \
+            --enable-libxcb --enable-libxcb-shm --enable-libxcb-xfixes --enable-libxcb-shape 2>&1 | tee configure.out
           # configure prints this on stdout and records it nowhere else, so it is captured above
           # and grepped from the file -- checked before the build so a licensing surprise costs
           # seconds instead of minutes.
@@ -290,6 +315,12 @@ jobs:
               echo "::error::v4l2 is not among the enabled input devices"
               exit 1
           }
+          # x11grab (xcbgrab.c) is named for its indev entry too, unlike v4l2 it has no alias.
+          awk '/^Enabled indevs:/ { g = 1; next } /^Enabled outdevs/ { g = 0 } g' configure.out \
+            | tr ' ' '\n' | grep -qx x11grab || {
+              echo "::error::x11grab is not among the enabled input devices"
+              exit 1
+          }
           # Assert WHICH external libraries got linked, not just that the build succeeded. The
           # relocatability check below only catches a dependency that resolves outside the
           # allowlist, and only after a full build; this names the cause immediately. It also
@@ -297,10 +328,10 @@ jobs:
           # macOS kit acquired Homebrew's sdl2.
           #
           # iconv is in the list because glibc provides it in libc itself, so unlike on macOS
-          # there is no -liconv to leak and nothing to disable; libdav1d is the one non-system
-          # entry and it is static.
+          # there is no -liconv to leak and nothing to disable; libdav1d and the xcb group are the
+          # non-system entries, and both are static (the previous step pruned xcb's .so files).
           externals=$(awk '/^External libraries:/ { grab = 1; next } /^External libraries providing/ { grab = 0 } grab && NF { for (i = 1; i <= NF; i++) print $i }' configure.out | sort -u)
-          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(iconv|zlib|bzlib|libdav1d|ffnvcodec)$' || true)
+          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(iconv|zlib|bzlib|libdav1d|ffnvcodec|libxcb|libxcb[_-]shm|libxcb[_-]shape|libxcb[_-]xfixes)$' || true)
           if [ -n "$unexpected" ]; then
               echo "::error::configure linked external libraries beyond the expected set, so this kit would only load on a machine that has them:"
               printf '%s\n' "$unexpected"
@@ -308,6 +339,10 @@ jobs:
           fi
           printf '%s\n' "$externals" | grep -qx libdav1d || {
               echo "::error::libdav1d is not among the linked external libraries"
+              exit 1
+          }
+          printf '%s\n' "$externals" | grep -qE '^libxcb$' || {
+              echo "::error::libxcb is not among the linked external libraries"
               exit 1
           }
           make -j"$(nproc)"
@@ -415,12 +450,13 @@ jobs:
 
       # The reason each slice is built on its own runner rather than cross-compiled: this executes
       # it. Loads the set by absolute path with nothing preloaded and the most dependent library
-      # first, then asks for the three things the consumer needs and that static analysis cannot
-      # confirm: that v4l2 is registered, that the static dav1d really is inside libavcodec, and
-      # that libavutil can create a VAAPI device type. Creating an actual VAAPI device is not
-      # possible here -- a hosted runner has no GPU -- so type lookup is as far as this can
-      # honestly go, and the real hardware check happens in StreamDock's own suites.
-      - name: load the kit and confirm v4l2, libdav1d and the VAAPI device type
+      # first, then asks for the four things the consumer needs and that static analysis cannot
+      # confirm: that v4l2 and x11grab are registered, that the static dav1d really is inside
+      # libavcodec, and that libavutil can create a VAAPI device type. Creating an actual VAAPI
+      # device, or an x11grab capture, is not possible here -- a hosted runner has no GPU and no
+      # X server -- so registration/type lookup is as far as this can honestly go, and the real
+      # hardware/display check happens in StreamDock's own suites.
+      - name: load the kit and confirm v4l2, x11grab, libdav1d and the VAAPI device type
         run: |
           cat > probe.c <<'EOF'
           // RTLD_DEFAULT is a GNU extension and glibc's dlfcn.h hides it without this, so the
@@ -439,17 +475,24 @@ jobs:
               const void *(*next)(const void *) = dlsym(h, "av_input_video_device_next");
               if (!reg || !next) { fprintf(stderr, "dlsym failed\n"); return 2; }
               reg();
+              int v4l2_ok = 0, x11grab_ok = 0;
               const void *f = NULL;
               while ((f = next(f))) {
                   // strstr, not strcmp: an AVInputFormat's name can be a comma-separated alias
-                  // list, and this one is "video4linux2,v4l2". configure's own component list
-                  // spells it plainly as v4l2, which is what makes the exact-match check in the
-                  // configure step correct and this one wrong.
+                  // list, and v4l2's is "video4linux2,v4l2" (x11grab has no alias, but strstr
+                  // matches it fine too). configure's own component list spells it plainly as
+                  // v4l2/x11grab, which is what makes the exact-match checks in the configure
+                  // step correct and this one wrong. Checked across the whole list rather than
+                  // breaking on first match, since either name could come first.
                   const char *n = *(const char *const *)f;
-                  if (n && strstr(n, "v4l2")) break;
+                  if (!n) continue;
+                  if (strstr(n, "v4l2")) v4l2_ok = 1;
+                  if (strstr(n, "x11grab")) x11grab_ok = 1;
               }
-              if (!f) { fprintf(stderr, "v4l2 not registered\n"); return 3; }
+              if (!v4l2_ok) { fprintf(stderr, "v4l2 not registered\n"); return 3; }
               printf("v4l2 registered\n");
+              if (!x11grab_ok) { fprintf(stderr, "x11grab not registered\n"); return 6; }
+              printf("x11grab registered\n");
               // libavcodec and libavutil are already loaded as libavdevice's dependencies, so
               // RTLD_DEFAULT finds them.
               const void *(*find)(const char *) = dlsym(RTLD_DEFAULT, "avcodec_find_decoder_by_name");
