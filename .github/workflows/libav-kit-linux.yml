@@ -285,7 +285,15 @@ jobs:
             --enable-ffnvcodec --enable-nvdec --enable-nvenc --enable-cuda --enable-cuvid \
             --enable-zlib --enable-bzlib \
             --enable-libdav1d \
-            --enable-libxcb --enable-libxcb-shm --enable-libxcb-xfixes --enable-libxcb-shape 2>&1 | tee configure.out
+            --enable-libxcb --enable-libxcb-shm --enable-libxcb-xfixes --enable-libxcb-shape \
+            --pkg-config-flags=--static 2>&1 | tee configure.out
+          # --pkg-config-flags=--static: xcb.pc declares libXau/libXdmcp as Requires.private --
+          # invisible to a plain `pkg-config --libs xcb`, which is all configure's own internal
+          # link test uses otherwise. Since the previous step deleted libxcb.so specifically so
+          # the real link has to go through the static archive, that internal test needs the same
+          # --static view or it fails with "libxcb requested but not found" despite xcb.pc being
+          # perfectly valid. Confirmed directly: `pkg-config --libs xcb` is just "-lxcb";
+          # `pkg-config --static --libs xcb` is "-lxcb -lXau -lXdmcp".
           # configure prints this on stdout and records it nowhere else, so it is captured above
           # and grepped from the file -- checked before the build so a licensing surprise costs
           # seconds instead of minutes.
