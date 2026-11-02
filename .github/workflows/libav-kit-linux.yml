@@ -155,22 +155,27 @@ jobs:
       # desktop source on Linux (they open x11grab through this libav directly, with no CLI
       # fallback, unlike RecorderService's recording path).
       #
-      # Built statically, as BtbN does. Debian's xcb-shm/xfixes/shape packages are .a-only, but
-      # the core chain -- libxcb, libXau, libXdmcp, and xfixes's own libxcb-render dependency --
-      # ships both .a and .so, and a plain -lxcb prefers the .so. That would leave a real X11
-      # runtime dependency in libavdevice's NEEDED list, which is exactly backwards: a headless
-      # node with no X libraries installed still has to load this kit. Deleting the .so (not the
-      # .a) is simpler and more reliable than out-ordering pkg-config's own dynamic -lxcb on the
-      # link line through configure's extra-libs.
+      # Built statically, as BtbN does. On debian:11, every package in this chain --
+      # libxcb/libxcb-shm/libxcb-xfixes/libxcb-shape, libXau, libXdmcp, and xfixes's own
+      # libxcb-render dependency -- ships both .a and .so (checked against the actual build_image;
+      # a newer Ubuntu's xcb-shm/xfixes/shape packages happen to be .a-only, which does not
+      # generalise here), and a plain -lxcb prefers the .so. That would leave a real X11 runtime
+      # dependency in libavdevice's NEEDED list, which is exactly backwards: a headless node with
+      # no X libraries installed still has to load this kit. Deleting the .so (not the .a) is
+      # simpler and more reliable than out-ordering pkg-config's own dynamic -lxcb on the link
+      # line through configure's extra-libs.
       - name: install xcb and force it to link statically
         run: |
           apt-get install -y --no-install-recommends \
             libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev libxcb-shape0-dev
           multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
           libdir="/usr/lib/$multiarch"
-          rm -f "$libdir"/libxcb.so* "$libdir"/libXau.so* "$libdir"/libXdmcp.so* "$libdir"/libxcb-render.so*
+          rm -f "$libdir"/libxcb.so* "$libdir"/libXau.so* "$libdir"/libXdmcp.so* \
+            "$libdir"/libxcb-render.so* "$libdir"/libxcb-shm.so* "$libdir"/libxcb-xfixes.so* \
+            "$libdir"/libxcb-shape.so*
           echo "remaining xcb/X11 libraries in $libdir (static archives only, no .so):"
-          ls "$libdir"/libxcb* "$libdir"/libX{au,dmcp}* 2>/dev/null
+          # No brace expansion: this container's run steps default to sh (dash), not bash.
+          ls "$libdir"/libxcb* "$libdir"/libXau* "$libdir"/libXdmcp* 2>/dev/null
 
       # Recorded in the log and the summary because it is the single fact this whole workflow
       # turns on: a kit built against a libva that HAS vaMapBuffer2 would reintroduce the abort
