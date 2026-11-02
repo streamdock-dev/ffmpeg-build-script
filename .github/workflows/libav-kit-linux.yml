@@ -328,10 +328,12 @@ jobs:
               echo "::error::v4l2 is not among the enabled input devices"
               exit 1
           }
-          # x11grab (xcbgrab.c) is named for its indev entry too, unlike v4l2 it has no alias.
+          # The indev's configure-time component name is "xcbgrab" (its source file), not
+          # "x11grab" -- that spelling is only the AVInputFormat's registered .name, kept for
+          # `-f x11grab` CLI compatibility, which is what the runtime probe below checks instead.
           awk '/^Enabled indevs:/ { g = 1; next } /^Enabled outdevs/ { g = 0 } g' configure.out \
-            | tr ' ' '\n' | grep -qx x11grab || {
-              echo "::error::x11grab is not among the enabled input devices"
+            | tr ' ' '\n' | grep -qx xcbgrab || {
+              echo "::error::xcbgrab (x11grab) is not among the enabled input devices"
               exit 1
           }
           # Assert WHICH external libraries got linked, not just that the build succeeded. The
