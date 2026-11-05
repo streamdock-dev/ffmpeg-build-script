@@ -177,7 +177,7 @@ jobs:
   # fork: StreamDock's own CI curls prebuilt binaries for every other
   # platform and has no macOS equivalent to point at (evermeet.cx is the
   # only other macOS source and ships a GPL build; see
-  # docs/macos-lgpl-ffmpeg-build-plan.md in the StreamDock repo). Matrixed
+  # Docs/Reference/ThirdParty/ffmpeg-lgpl-fork-status.md in the StreamDock repo). Matrixed
   # over both architectures GitHub still supports natively post the macOS-13
   # retirement (Dec 2025): macos-15 for arm64, macos-15-intel for x86_64 (its
   # replacement, available through Aug 2027) -- no cross-compiling either
