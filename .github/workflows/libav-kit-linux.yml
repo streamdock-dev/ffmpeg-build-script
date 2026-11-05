@@ -39,7 +39,7 @@
 # when the FFmpeg generation does.
 #
 # See StreamDock's Docs/Reference/ThirdParty/ffmpeg-lgpl-fork-status.md and
-# Docs/ffmpeg-autogen-migration-plan.md.
+# Docs/Reference/in-process-libav.md.
 name: libav kit (Linux, shared)
 
 on:
