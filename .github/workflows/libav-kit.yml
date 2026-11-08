@@ -217,8 +217,13 @@ jobs:
               echo "::error::securetransport is not among the linked external libraries, so https will not open"
               exit 1
           }
+          # config_components.h, not config.h: per-component defines moved there in FFmpeg 5.1.
+          [ -f config_components.h ] || {
+              echo "::error::config_components.h is not where this step expects it"
+              exit 1
+          }
           for sym in HTTPS_PROTOCOL TLS_PROTOCOL; do
-              grep -q "^#define CONFIG_$sym 1$" config.h || {
+              grep -q "^#define CONFIG_$sym 1$" config_components.h || {
                   echo "::error::CONFIG_$sym is not enabled"
                   exit 1
               }

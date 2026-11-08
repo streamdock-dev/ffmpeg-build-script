@@ -369,8 +369,21 @@ jobs:
               echo "::error::config.h is not where this step expects it; the feature checks below cannot be trusted"
               exit 1
           }
-          for sym in VAAPI NVDEC CUDA OPENSSL HTTPS_PROTOCOL TLS_PROTOCOL; do
+          for sym in VAAPI NVDEC CUDA OPENSSL; do
               grep -q "^#define CONFIG_$sym 1$" config.h || {
+                  echo "::error::CONFIG_$sym is not enabled"
+                  exit 1
+              }
+          done
+          # Per-component defines (protocols, codecs, formats) live in config_components.h since
+          # FFmpeg 5.1, not config.h -- which is how the first run of this check failed a build
+          # that had https enabled.
+          [ -f config_components.h ] || {
+              echo "::error::config_components.h is not where this step expects it"
+              exit 1
+          }
+          for sym in HTTPS_PROTOCOL TLS_PROTOCOL; do
+              grep -q "^#define CONFIG_$sym 1$" config_components.h || {
                   echo "::error::CONFIG_$sym is not enabled"
                   exit 1
               }
