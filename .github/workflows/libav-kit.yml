@@ -54,6 +54,15 @@ on:
         description: deployment target; must not exceed what the consuming app supports
         required: true
         default: "11.0"
+      dry_run:
+        description: >-
+          build, verify and load-test the kit but keep it off the release, leaving it as a
+          workflow artifact instead. Use it for the first run after changing anything here: a
+          release asset is pinned by StreamDock's CI, so publishing one is not a step to take
+          before the build has been seen to pass.
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   libav-kit:
@@ -152,6 +161,7 @@ jobs:
             --enable-videotoolbox --enable-audiotoolbox --enable-avfoundation \
             --enable-zlib --enable-bzlib \
             --enable-libdav1d \
+            --enable-securetransport \
             --install-name-dir='@loader_path' \
             --extra-cflags="-mmacosx-version-min=${{ inputs.macos_min }}" \
             --extra-ldflags="-mmacosx-version-min=${{ inputs.macos_min }}" 2>&1 | tee configure.out
@@ -184,7 +194,16 @@ jobs:
           # them and the link fails. It only serves subtitle charset conversion, which neither
           # consumer uses, so it is dropped rather than patched with --extra-libs.
           # libdav1d is the one non-system entry, and it is static (see the dav1d step).
-          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(avfoundation|zlib|bzlib|libdav1d)$' || true)
+          #
+          # securetransport is re-enabled the same way zlib and bzlib are, and is just as
+          # system-resident: Security.framework and CoreFoundation, on every macOS. Without a TLS
+          # backend no https:// URL opens in-process -- HLS playlists and everything yt-dlp
+          # resolves (YouTube, Twitch, Kick) -- and the kits before this one had none, because
+          # --disable-autodetect skipped the check that enables it (found 2026-11-07). It is
+          # Apple's deprecated API, but FFmpeg 9.0 still ships it and it is the only TLS on macOS
+          # that adds no dependency; it verifies against the system keychain, which FFmpeg 9 does
+          # by default (tls_verify=1).
+          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(avfoundation|zlib|bzlib|libdav1d|securetransport)$' || true)
           if [ -n "$unexpected" ]; then
               echo "::error::configure linked external libraries beyond the expected system set, so this kit would only load on a machine that has them:"
               printf '%s\n' "$unexpected"
@@ -194,6 +213,16 @@ jobs:
               echo "::error::libdav1d is not among the linked external libraries"
               exit 1
           }
+          printf '%s\n' "$externals" | grep -qx securetransport || {
+              echo "::error::securetransport is not among the linked external libraries, so https will not open"
+              exit 1
+          }
+          for sym in HTTPS_PROTOCOL TLS_PROTOCOL; do
+              grep -q "^#define CONFIG_$sym 1$" config.h || {
+                  echo "::error::CONFIG_$sym is not enabled"
+                  exit 1
+              }
+          done
           make -j"$(sysctl -n hw.ncpu)"
           make install
 
@@ -327,11 +356,28 @@ jobs:
               if (!find) { fprintf(stderr, "dlsym avcodec_find_decoder_by_name failed\n"); return 2; }
               if (!find("libdav1d")) { fprintf(stderr, "libdav1d decoder not registered\n"); return 4; }
               printf("libdav1d registered\n");
+              // A real https fetch with FFmpeg's default verification on, against the system
+              // keychain. Proves the TLS backend is inside libavformat and works, not just that
+              // configure enabled it.
+              void (*net_init)(void) = dlsym(RTLD_DEFAULT, "avformat_network_init");
+              int (*open2)(void **, const char *, int, const void *, void **) = dlsym(RTLD_DEFAULT, "avio_open2");
+              int (*rd)(void *, unsigned char *, int) = dlsym(RTLD_DEFAULT, "avio_read");
+              int (*closep)(void **) = dlsym(RTLD_DEFAULT, "avio_closep");
+              if (!net_init || !open2 || !rd || !closep) { fprintf(stderr, "dlsym avio failed\n"); return 2; }
+              net_init();
+              void *io = NULL;
+              int r = open2(&io, argv[3], 1 /* AVIO_FLAG_READ */, NULL, NULL);
+              if (r < 0) { fprintf(stderr, "https open of %s failed: %d\n", argv[3], r); return 7; }
+              unsigned char buf[256];
+              int n = rd(io, buf, sizeof buf);
+              closep(&io);
+              if (n <= 0) { fprintf(stderr, "https read of %s returned %d\n", argv[3], n); return 7; }
+              printf("https fetched %d bytes from %s\n", n, argv[3]);
               return 0;
           }
           EOF
           clang -O1 -o probe probe.c
-          ./probe "$PWD/out/lib" "$SONAME_avdevice"
+          ./probe "$PWD/out/lib" "$SONAME_avdevice" "https://ffmpeg.org/"
 
       - name: package the kit
         run: |
@@ -349,7 +395,17 @@ jobs:
           shasum -a 256 "$name.tar.xz" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "KIT=$name.tar.xz" >> "$GITHUB_ENV"
 
+      - name: keep the kit as a workflow artifact (dry run)
+        if: inputs.dry_run
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KIT }}
+          path: ${{ env.KIT }}
+          retention-days: 7
+          if-no-files-found: error
+
       - name: upload to the release
+        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

@@ -65,6 +65,14 @@ on:
         description: sha256 of dav1d-<version>.tar.xz (as published alongside it on videolan.org)
         required: true
         default: "686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5"
+      openssl_version:
+        description: OpenSSL release linked statically into libavformat for https/tls (3.5 is the LTS line)
+        required: true
+        default: "3.5.9"
+      openssl_sha256:
+        description: sha256 of openssl-<version>.tar.gz (published beside it as a .sha256 on the GitHub release)
+        required: true
+        default: "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
       nv_codec_headers_version:
         description: nv-codec-headers tag supplying the NVDEC/NVENC headers (header-only, dlopened at runtime)
         required: true
@@ -144,7 +152,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential nasm pkg-config git curl ca-certificates xz-utils \
             libva-dev libbz2-dev zlib1g-dev \
-            meson ninja-build python3 patchelf binutils
+            meson ninja-build python3 patchelf binutils perl
           echo "libva-dev: $(dpkg-query -W -f='${Version}' libva-dev)"
           echo "glibc: $(getconf GNU_LIBC_VERSION)"
 
@@ -217,6 +225,47 @@ jobs:
               exit 1
           fi
 
+      # TLS, without which no https:// URL opens in-process: HLS playlists, and everything yt-dlp
+      # resolves (YouTube, Twitch, Kick). --disable-autodetect switches FFmpeg's TLS backend off
+      # along with everything else, and the kits before this one had none (found 2026-11-07).
+      #
+      # Why OpenSSL, static:
+      #   - Licence. FFmpeg's configure accepts OpenSSL 3 (Apache-2.0) in a non-GPL build as is,
+      #     so the kit stays LGPL v2.1. mbedTLS is on configure's version3 list, and gnutls pulls
+      #     in nettle and gmp, which are LGPLv3 -- either would move the kit to LGPLv3.
+      #   - ABI. There is no system TLS library with a stable ABI across the distributions this
+      #     kit targets (libssl.so.1.1 vs .so.3), so linking the system one would add a runtime
+      #     requirement the allowlist below exists to keep out.
+      #   - Static means its symbols have to be hidden, or they collide with the system libssl
+      #     that .NET loads into the same process for HttpClient: see --exclude-libs in the
+      #     configure step, and the exported-symbol check in the verify step.
+      #
+      # --openssldir=/etc/ssl is where the default trust store is looked for, which FFmpeg 9 uses
+      # because it verifies peers by default (tls_verify=1). That is right on Debian, Ubuntu, Arch
+      # and SteamOS (/etc/ssl/certs, hashed). Fedora, RHEL and openSUSE keep their bundle
+      # elsewhere; StreamDock's Core.Video points SSL_CERT_FILE at it on those, which OpenSSL
+      # honours ahead of the compiled-in path. no-module/no-dso/no-engine: nothing is ever loaded
+      # from beside it at runtime.
+      - name: build OpenSSL (static, for https)
+        run: |
+          ver='${{ inputs.openssl_version }}'
+          curl --fail -L --retry 6 --retry-all-errors --connect-timeout 30 \
+            "https://github.com/openssl/openssl/releases/download/openssl-$ver/openssl-$ver.tar.gz" -o openssl.tar.gz
+          echo '${{ inputs.openssl_sha256 }}  openssl.tar.gz' > openssl.tar.gz.sha256
+          sha256sum -c openssl.tar.gz.sha256
+          mkdir -p openssl-src
+          tar -xzf openssl.tar.gz -C openssl-src --strip-components=1
+          cd openssl-src
+          ./Configure --prefix="$PWD/../openssl-out" --libdir=lib --openssldir=/etc/ssl \
+            no-shared no-module no-dso no-engine no-tests no-docs no-apps -fPIC
+          make -j"$(nproc)" build_libs
+          make install_dev
+          cd ..
+          if ls openssl-out/lib/lib*.so* >/dev/null 2>&1; then
+              echo "::error::OpenSSL produced a shared object; it must be static only"
+              exit 1
+          fi
+
       # Headers only -- no NVIDIA library is linked or shipped. FFmpeg resolves the CUDA/NVDEC
       # entry points by dlopen at runtime, so a machine with no NVIDIA driver simply reports no
       # CUDA device and falls back, exactly as it does today with BtbN's kit.
@@ -235,11 +284,11 @@ jobs:
           # but not all dependencies are satisfied: ffnvcodec" -- a message that reads like a flag
           # problem rather than a path one. $PWD is the container's view and is what both
           # prefixes were installed under.
-          echo "PKG_CONFIG_PATH=$PWD/dav1d-out/lib/pkgconfig:$PWD/nv-out/lib/pkgconfig" >> "$GITHUB_ENV"
+          pcp="$PWD/dav1d-out/lib/pkgconfig:$PWD/nv-out/lib/pkgconfig:$PWD/openssl-out/lib/pkgconfig"
+          echo "PKG_CONFIG_PATH=$pcp" >> "$GITHUB_ENV"
           # Asserted here, where the cause is still obvious, rather than left to configure.
-          PKG_CONFIG_PATH="$PWD/dav1d-out/lib/pkgconfig:$PWD/nv-out/lib/pkgconfig" \
-            pkg-config --modversion ffnvcodec dav1d || {
-              echo "::error::ffnvcodec and/or dav1d are not visible to pkg-config under $PWD"
+          PKG_CONFIG_PATH="$pcp" pkg-config --modversion ffnvcodec dav1d openssl || {
+              echo "::error::ffnvcodec, dav1d and/or openssl are not visible to pkg-config under $PWD"
               exit 1
           }
 
@@ -285,8 +334,14 @@ jobs:
             --enable-ffnvcodec --enable-nvdec --enable-nvenc --enable-cuda --enable-cuvid \
             --enable-zlib --enable-bzlib \
             --enable-libdav1d \
+            --enable-openssl \
             --enable-libxcb --enable-libxcb-shm --enable-libxcb-xfixes --enable-libxcb-shape \
+            --extra-ldflags='-Wl,--exclude-libs,libssl.a:libcrypto.a' \
             --pkg-config-flags=--static 2>&1 | tee configure.out
+          # --exclude-libs: OpenSSL's symbols stay local to libavformat. Exported, they would be
+          # bound through the global scope like any other, so a process that already has the
+          # system libssl loaded -- .NET does, for HttpClient -- could have libavformat's TLS
+          # calls land in a different OpenSSL with different struct layouts, or the reverse.
           # --pkg-config-flags=--static: xcb.pc declares libXau/libXdmcp as Requires.private --
           # invisible to a plain `pkg-config --libs xcb`, which is all configure's own internal
           # link test uses otherwise. Since the previous step deleted libxcb.so specifically so
@@ -314,7 +369,7 @@ jobs:
               echo "::error::config.h is not where this step expects it; the feature checks below cannot be trusted"
               exit 1
           }
-          for sym in VAAPI NVDEC CUDA; do
+          for sym in VAAPI NVDEC CUDA OPENSSL HTTPS_PROTOCOL TLS_PROTOCOL; do
               grep -q "^#define CONFIG_$sym 1$" config.h || {
                   echo "::error::CONFIG_$sym is not enabled"
                   exit 1
@@ -346,7 +401,7 @@ jobs:
           # there is no -liconv to leak and nothing to disable; libdav1d and the xcb group are the
           # non-system entries, and both are static (the previous step pruned xcb's .so files).
           externals=$(awk '/^External libraries:/ { grab = 1; next } /^External libraries providing/ { grab = 0 } grab && NF { for (i = 1; i <= NF; i++) print $i }' configure.out | sort -u)
-          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(iconv|zlib|bzlib|libdav1d|ffnvcodec|libxcb|libxcb[_-]shm|libxcb[_-]shape|libxcb[_-]xfixes)$' || true)
+          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(iconv|zlib|bzlib|libdav1d|openssl|ffnvcodec|libxcb|libxcb[_-]shm|libxcb[_-]shape|libxcb[_-]xfixes)$' || true)
           if [ -n "$unexpected" ]; then
               echo "::error::configure linked external libraries beyond the expected set, so this kit would only load on a machine that has them:"
               printf '%s\n' "$unexpected"
@@ -354,6 +409,10 @@ jobs:
           fi
           printf '%s\n' "$externals" | grep -qx libdav1d || {
               echo "::error::libdav1d is not among the linked external libraries"
+              exit 1
+          }
+          printf '%s\n' "$externals" | grep -qx openssl || {
+              echo "::error::openssl is not among the linked external libraries, so https will not open"
               exit 1
           }
           printf '%s\n' "$externals" | grep -qE '^libxcb$' || {
@@ -455,6 +514,19 @@ jobs:
               esac
           done
 
+          # The static OpenSSL must not leak into any library's dynamic symbol table; see
+          # --exclude-libs in the configure step for what an exported copy collides with.
+          for so in "$lib"/*.so.*; do
+              [ -L "$so" ] && continue
+              exported=$(nm -D --defined-only "$so" | awk '{ print $NF }' \
+                | grep -E '^(SSL|SSL_CTX|OPENSSL|CRYPTO|EVP|X509|BIO|ERR|RAND|PEM|ASN1|BN|OSSL)_' | head -5 || true)
+              if [ -n "$exported" ]; then
+                  echo "::error::$(basename "$so") exports OpenSSL symbols, e.g.:"
+                  printf '%s\n' "$exported"
+                  fail=1
+              fi
+          done
+
           # Dumped to a file first: `strings | grep -m1` has grep close the pipe on its match,
           # which SIGPIPEs strings, and under pipefail that reads as failure.
           strings "$lib/$SONAME_avutil" > avutil.strings
@@ -524,11 +596,28 @@ jobs:
               if (!type_from_name) { fprintf(stderr, "dlsym av_hwdevice_find_type_by_name failed\n"); return 2; }
               if (type_from_name("vaapi") == 0) { fprintf(stderr, "vaapi is not a known hwdevice type\n"); return 5; }
               printf("vaapi hwdevice type present\n");
+              // A real https fetch with FFmpeg's default verification on, against the container's
+              // own trust store at the compiled-in /etc/ssl. Proves the TLS backend is inside
+              // libavformat and works, not just that configure enabled it.
+              void (*net_init)(void) = dlsym(RTLD_DEFAULT, "avformat_network_init");
+              int (*open2)(void **, const char *, int, const void *, void **) = dlsym(RTLD_DEFAULT, "avio_open2");
+              int (*rd)(void *, unsigned char *, int) = dlsym(RTLD_DEFAULT, "avio_read");
+              int (*closep)(void **) = dlsym(RTLD_DEFAULT, "avio_closep");
+              if (!net_init || !open2 || !rd || !closep) { fprintf(stderr, "dlsym avio failed\n"); return 2; }
+              net_init();
+              void *io = NULL;
+              int r = open2(&io, argv[3], 1 /* AVIO_FLAG_READ */, NULL, NULL);
+              if (r < 0) { fprintf(stderr, "https open of %s failed: %d\n", argv[3], r); return 7; }
+              unsigned char buf[256];
+              int n = rd(io, buf, sizeof buf);
+              closep(&io);
+              if (n <= 0) { fprintf(stderr, "https read of %s returned %d\n", argv[3], n); return 7; }
+              printf("https fetched %d bytes from %s\n", n, argv[3]);
               return 0;
           }
           EOF
           gcc -O1 -o probe probe.c -ldl
-          ./probe "$PWD/out/lib" "$SONAME_avdevice"
+          ./probe "$PWD/out/lib" "$SONAME_avdevice" "https://ffmpeg.org/"
 
       - name: package the kit
         run: |
@@ -542,6 +631,7 @@ jobs:
           rm -rf "$name/lib/pkgconfig"
           cp src/COPYING.LGPLv2.1 "$name/"
           cp dav1d-src/COPYING "$name/COPYING.dav1d"
+          cp openssl-src/LICENSE.txt "$name/COPYING.openssl"
           tar -cJf "$name.tar.xz" "$name"
           sha256sum "$name.tar.xz" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "KIT=$name.tar.xz" >> "$GITHUB_ENV"
