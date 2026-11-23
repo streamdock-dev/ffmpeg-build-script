@@ -12,7 +12,9 @@
 #     The one exception is dav1d (BSD-2-Clause), because FFmpeg 7.1 has no native AV1 software
 #     decoder and VideoToolbox decodes AV1 only on M3 and later: without it an M1/M2 Mac cannot
 #     play an AV1 file at all. It is built from a pinned, checksummed tarball as a static PIC
-#     archive and linked INTO libavcodec, so the kit still depends on nothing outside itself. --disable-autodetect is what makes that true and is
+#     archive and linked INTO libavcodec, so the kit still depends on nothing outside itself.
+#     libsrt (MPL-2.0) and the OpenSSL it needs for encryption are the other exception, for
+#     srt://, built and linked into libavformat the same way. --disable-autodetect is what makes that true and is
 #     not optional here: FFmpeg's configure links whatever it happens to find, and the first
 #     hand-built pair of these kits silently picked up Homebrew's sdl2-compat into libavdevice,
 #     which loads only on a machine that also has it. A hosted runner carries far more preinstalled
@@ -50,6 +52,22 @@ on:
         description: sha256 of dav1d-<version>.tar.xz (as published alongside it on videolan.org)
         required: true
         default: "686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5"
+      openssl_version:
+        description: OpenSSL release linked statically into libavformat as libsrt's crypto only (https stays on SecureTransport)
+        required: true
+        default: "3.5.9"
+      openssl_sha256:
+        description: sha256 of openssl-<version>.tar.gz (published beside it as a .sha256 on the GitHub release)
+        required: true
+        default: "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
+      srt_version:
+        description: libsrt release linked statically into libavformat for srt://
+        required: true
+        default: "1.5.7"
+      srt_sha256:
+        description: sha256 of GitHub's archive of the v<version> tag (Haivision publishes no tarball of its own)
+        required: true
+        default: "017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b"
       macos_min:
         description: deployment target; must not exceed what the consuming app supports
         required: true
@@ -85,9 +103,9 @@ jobs:
       # licensing problem rather than a missing tool. Harmless on arm64, where there is no x86
       # assembly to build, so it is not matrix-conditional.
       # meson and ninja build dav1d; pkgconf is how FFmpeg's configure finds it. dav1d's x86
-      # assembly needs nasm too.
+      # assembly needs nasm too. cmake builds libsrt.
       - name: install the assembler FFmpeg's x86 code needs
-        run: brew install nasm meson ninja pkgconf
+        run: brew install nasm meson ninja pkgconf cmake
 
       # Static and position-independent, so it links into libavcodec.dylib and the kit gains no
       # dylib to ship or relocate. The deployment target goes in through the environment as well
@@ -117,6 +135,71 @@ jobs:
               echo "::error::dav1d produced a dylib; it must be static only"
               exit 1
           fi
+
+      # SRT, without which no srt:// URL opens in-process: an SRT Stream source, or an ISO
+      # recording of one (found missing 2026-11-23; Windows had it from BtbN's kit).
+      #
+      # libsrt needs a crypto library and has no Apple backend (openssl, openssl-evp, gnutls,
+      # mbedtls and botan are its choices), so it gets the same static OpenSSL the Linux kit links,
+      # for the same licence reason (see libav-kit-linux.yml). It is libsrt's alone: FFmpeg's own
+      # TLS stays SecureTransport, since --enable-openssl is not passed. libsrt is MPL-2.0, which
+      # FFmpeg's configure lists under neither GPL nor version3, so the kit stays LGPL v2.1.
+      #
+      # Both are compiled with hidden visibility, and libsrt with SRT_API defined empty (its
+      # header otherwise marks every srt_* entry point visibility("default") on Unix), so neither
+      # adds to libavformat's exports; the verify step checks that. libsrt is C++, so libavformat
+      # gains /usr/lib/libc++, which srt.pc's Libs.private names (ENABLE_CXX_DEPS). Only libcrypto
+      # is used, so OpenSSL's openssldir is irrelevant here.
+      - name: build OpenSSL and libsrt (static, for srt://)
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ inputs.macos_min }}
+        run: |
+          ver='${{ inputs.openssl_version }}'
+          curl --fail -L --retry 6 --retry-all-errors --connect-timeout 30 \
+            "https://github.com/openssl/openssl/releases/download/openssl-$ver/openssl-$ver.tar.gz" -o openssl.tar.gz
+          echo '${{ inputs.openssl_sha256 }}  openssl.tar.gz' > openssl.tar.gz.sha256
+          shasum -a 256 -c openssl.tar.gz.sha256
+          mkdir -p openssl-src
+          tar -xzf openssl.tar.gz -C openssl-src --strip-components=1
+          cd openssl-src
+          ./Configure "darwin64-${{ matrix.arch }}-cc" --prefix="$PWD/../openssl-out" --libdir=lib \
+            no-shared no-module no-dso no-engine no-tests no-docs no-apps \
+            -fvisibility=hidden "-mmacosx-version-min=${{ inputs.macos_min }}"
+          make -j"$(sysctl -n hw.ncpu)" build_libs
+          make install_dev
+          cd ..
+          if ls openssl-out/lib/lib*.dylib >/dev/null 2>&1; then
+              echo "::error::OpenSSL produced a dylib; it must be static only"
+              exit 1
+          fi
+
+          ver='${{ inputs.srt_version }}'
+          curl --fail -L --retry 6 --retry-all-errors --connect-timeout 30 \
+            "https://github.com/Haivision/srt/archive/refs/tags/v$ver.tar.gz" -o srt.tar.gz
+          echo '${{ inputs.srt_sha256 }}  srt.tar.gz' > srt.tar.gz.sha256
+          shasum -a 256 -c srt.tar.gz.sha256
+          mkdir -p srt-src
+          tar -xzf srt.tar.gz -C srt-src --strip-components=1
+          PKG_CONFIG_PATH="$PWD/openssl-out/lib/pkgconfig" cmake -S srt-src -B srt-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/srt-out" -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET='${{ inputs.macos_min }}' \
+            -DCMAKE_OSX_ARCHITECTURES='${{ matrix.arch }}' \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DCMAKE_C_VISIBILITY_PRESET=hidden -DCMAKE_CXX_VISIBILITY_PRESET=hidden \
+            -DCMAKE_VISIBILITY_INLINES_HIDDEN=ON \
+            -DCMAKE_C_FLAGS='-DSRT_API=' -DCMAKE_CXX_FLAGS='-DSRT_API=' \
+            -DENABLE_SHARED=OFF -DENABLE_STATIC=ON \
+            -DENABLE_APPS=OFF -DENABLE_TESTING=OFF -DENABLE_UNITTESTS=OFF -DENABLE_EXAMPLES=OFF \
+            -DENABLE_ENCRYPTION=ON -DUSE_ENCLIB=openssl-evp -DUSE_OPENSSL_PC=ON
+          cmake --build srt-src/build -j"$(sysctl -n hw.ncpu)"
+          cmake --install srt-src/build
+          if ls srt-out/lib/libsrt*.dylib >/dev/null 2>&1; then
+              echo "::error::libsrt produced a dylib; it must be static only"
+              exit 1
+          fi
+          # srt.pc names OpenSSL as Requires.private, so configure needs openssl.pc visible too.
+          PKG_CONFIG_PATH="$PWD/openssl-out/lib/pkgconfig:$PWD/srt-out/lib/pkgconfig" pkg-config --static --libs srt
 
       - name: fetch and verify the FFmpeg source
         run: |
@@ -150,7 +233,10 @@ jobs:
       # loaded in strict dependency order. src/95-ffmpeg.sh carries the long version of this.
       - name: configure and build
         env:
-          PKG_CONFIG_PATH: ${{ github.workspace }}/dav1d-out/lib/pkgconfig
+          PKG_CONFIG_PATH: ${{ github.workspace }}/dav1d-out/lib/pkgconfig:${{ github.workspace }}/openssl-out/lib/pkgconfig:${{ github.workspace }}/srt-out/lib/pkgconfig
+        # --pkg-config-flags=--static: libsrt is a static archive, so its link needs what srt.pc
+        # lists as private -- libc++, and OpenSSL's libcrypto through Requires.private. Without it
+        # configure's own link test fails with "libsrt not found" despite srt.pc being valid.
         run: |
           cd src
           ./configure \
@@ -162,6 +248,8 @@ jobs:
             --enable-zlib --enable-bzlib \
             --enable-libdav1d \
             --enable-securetransport \
+            --enable-libsrt \
+            --pkg-config-flags=--static \
             --install-name-dir='@loader_path' \
             --extra-cflags="-mmacosx-version-min=${{ inputs.macos_min }}" \
             --extra-ldflags="-mmacosx-version-min=${{ inputs.macos_min }}" 2>&1 | tee configure.out
@@ -203,7 +291,9 @@ jobs:
           # Apple's deprecated API, but FFmpeg 9.0 still ships it and it is the only TLS on macOS
           # that adds no dependency; it verifies against the system keychain, which FFmpeg 9 does
           # by default (tls_verify=1).
-          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(avfoundation|zlib|bzlib|libdav1d|securetransport)$' || true)
+          # libsrt is static too, with its OpenSSL inside it (see the libsrt step); openssl itself
+          # is not in this list, because FFmpeg's own TLS is not OpenSSL here.
+          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(avfoundation|zlib|bzlib|libdav1d|securetransport|libsrt)$' || true)
           if [ -n "$unexpected" ]; then
               echo "::error::configure linked external libraries beyond the expected system set, so this kit would only load on a machine that has them:"
               printf '%s\n' "$unexpected"
@@ -217,12 +307,16 @@ jobs:
               echo "::error::securetransport is not among the linked external libraries, so https will not open"
               exit 1
           }
+          printf '%s\n' "$externals" | grep -qx libsrt || {
+              echo "::error::libsrt is not among the linked external libraries, so srt:// will not open"
+              exit 1
+          }
           # config_components.h, not config.h: per-component defines moved there in FFmpeg 5.1.
           [ -f config_components.h ] || {
               echo "::error::config_components.h is not where this step expects it"
               exit 1
           }
-          for sym in HTTPS_PROTOCOL TLS_PROTOCOL; do
+          for sym in HTTPS_PROTOCOL TLS_PROTOCOL LIBSRT_PROTOCOL; do
               grep -q "^#define CONFIG_$sym 1$" config_components.h || {
                   echo "::error::CONFIG_$sym is not enabled"
                   exit 1
@@ -313,6 +407,21 @@ jobs:
               done < <(otool -L "$dylib" | tail -n +2 | awk '{print $1}' | grep '^@loader_path/' | sort -u)
           done
 
+          # libsrt's and OpenSSL's C entry points must stay out of every library's exports (see
+          # the libsrt step). Two-level namespaces keep an exported copy from being bound in place
+          # of another image's, so this is hygiene rather than a crash guard, and it is limited to
+          # prefixes only C defines: OpenSSL's assembly declares its own globals, which hidden
+          # visibility does not reach.
+          for dylib in "$lib"/*.dylib; do
+              [ -L "$dylib" ] && continue
+              exported=$(nm -gU "$dylib" | awk '{ print $NF }' | grep -E '^_(srt|SSL|EVP)_' | head -5 || true)
+              if [ -n "$exported" ]; then
+                  echo "::error::$(basename "$dylib") exports libsrt or OpenSSL symbols, e.g.:"
+                  printf '%s\n' "$exported"
+                  fail=1
+              fi
+          done
+
           # Dumped to a file first: `strings | grep -m1` has grep close the pipe on its match,
           # which SIGPIPEs strings, and under pipefail that reads as failure.
           strings "$lib/$SONAME_avutil.dylib" > avutil.strings
@@ -334,7 +443,7 @@ jobs:
       # (a hosted runner has no camera), so registration is as far as this can honestly go. Then
       # does the same for the libdav1d AV1 decoder, which also proves the static archive's code
       # really is inside libavcodec rather than referenced from somewhere else.
-      - name: load the kit and confirm avfoundation and libdav1d register
+      - name: load the kit and confirm avfoundation, libdav1d, srt and https
         run: |
           cat > probe.c <<'EOF'
           #include <stdio.h>
@@ -370,6 +479,14 @@ jobs:
               int (*closep)(void **) = dlsym(RTLD_DEFAULT, "avio_closep");
               if (!net_init || !open2 || !rd || !closep) { fprintf(stderr, "dlsym avio failed\n"); return 2; }
               net_init();
+              // srt:// resolves to libavformat's libsrt protocol, which it does only when the static
+              // libsrt is inside it: there is no built-in srt protocol to fall back to. Opening one
+              // needs a peer, which a hosted runner does not have.
+              const char *(*proto)(const char *) = dlsym(RTLD_DEFAULT, "avio_find_protocol_name");
+              if (!proto) { fprintf(stderr, "dlsym avio_find_protocol_name failed\n"); return 2; }
+              const char *srt = proto("srt://127.0.0.1:9000?mode=caller");
+              if (!srt || strcmp(srt, "libsrt")) { fprintf(stderr, "srt:// resolves to %s, not libsrt\n", srt ? srt : "nothing"); return 8; }
+              printf("srt:// resolves to libsrt\n");
               // Several hosts, passing on the first that answers: one site timing out from a
               // runner (ffmpeg.org did, 2026-11-08) is the network, not the kit.
               for (int i = 3; i < argc; i++) {
@@ -402,6 +519,8 @@ jobs:
           rm -rf "$name/lib/pkgconfig"
           cp src/COPYING.LGPLv2.1 "$name/"
           cp dav1d-src/COPYING "$name/COPYING.dav1d"
+          cp openssl-src/LICENSE.txt "$name/COPYING.openssl"
+          cp srt-src/LICENSE "$name/COPYING.srt"
           tar -cJf "$name.tar.xz" "$name"
           shasum -a 256 "$name.tar.xz" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "KIT=$name.tar.xz" >> "$GITHUB_ENV"

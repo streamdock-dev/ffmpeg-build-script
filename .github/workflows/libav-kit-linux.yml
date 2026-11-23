@@ -73,6 +73,14 @@ on:
         description: sha256 of openssl-<version>.tar.gz (published beside it as a .sha256 on the GitHub release)
         required: true
         default: "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
+      srt_version:
+        description: libsrt release linked statically into libavformat for srt:// (its crypto is the OpenSSL above)
+        required: true
+        default: "1.5.7"
+      srt_sha256:
+        description: sha256 of GitHub's archive of the v<version> tag (Haivision publishes no tarball of its own)
+        required: true
+        default: "017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b"
       nv_codec_headers_version:
         description: nv-codec-headers tag supplying the NVDEC/NVENC headers (header-only, dlopened at runtime)
         required: true
@@ -125,6 +133,7 @@ jobs:
       #   - libbz2-dev / zlib1g-dev: both are re-enabled explicitly on top of --disable-autodetect
       #     (see the configure step), so their headers must be present or configure fails.
       #   - meson/ninja: dav1d's build system.
+      #   - cmake/g++: libsrt's build system, and libsrt is C++.
       - name: install build dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
@@ -152,7 +161,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential nasm pkg-config git curl ca-certificates xz-utils \
             libva-dev libbz2-dev zlib1g-dev \
-            meson ninja-build python3 patchelf binutils perl
+            meson ninja-build cmake g++ python3 patchelf binutils perl
           echo "libva-dev: $(dpkg-query -W -f='${Version}' libva-dev)"
           echo "glibc: $(getconf GNU_LIBC_VERSION)"
 
@@ -266,6 +275,40 @@ jobs:
               exit 1
           fi
 
+      # SRT, without which no srt:// URL opens in-process: an SRT Stream source, or an ISO
+      # recording of one (found missing 2026-11-23; Windows had it from BtbN's kit).
+      #
+      # Its crypto is the OpenSSL built above (openssl-evp, the backend libsrt picks for OpenSSL 3),
+      # for the same licence reason that one was chosen; libsrt itself is MPL-2.0, which FFmpeg's
+      # configure lists under neither GPL nor version3, so the kit stays LGPL v2.1. Static and
+      # hidden like OpenSSL (--exclude-libs in the configure step), so a libsrt elsewhere in the
+      # process cannot bind to this one or the reverse. It is C++, so libavformat gains a
+      # libstdc++ dependency, which the allowlist in the verify step already permits; srt.pc's
+      # Libs.private names it (ENABLE_CXX_DEPS), which is how FFmpeg's C link finds it.
+      # USE_OPENSSL_PC: found through openssl-out's own .pc, so nothing on the image is picked up.
+      - name: build libsrt (static, for srt://)
+        run: |
+          ver='${{ inputs.srt_version }}'
+          curl --fail -L --retry 6 --retry-all-errors --connect-timeout 30 \
+            "https://github.com/Haivision/srt/archive/refs/tags/v$ver.tar.gz" -o srt.tar.gz
+          echo '${{ inputs.srt_sha256 }}  srt.tar.gz' > srt.tar.gz.sha256
+          sha256sum -c srt.tar.gz.sha256
+          mkdir -p srt-src
+          tar -xzf srt.tar.gz -C srt-src --strip-components=1
+          PKG_CONFIG_PATH="$PWD/openssl-out/lib/pkgconfig" cmake -S srt-src -B srt-src/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/srt-out" -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DENABLE_SHARED=OFF -DENABLE_STATIC=ON \
+            -DENABLE_APPS=OFF -DENABLE_TESTING=OFF -DENABLE_UNITTESTS=OFF -DENABLE_EXAMPLES=OFF \
+            -DENABLE_ENCRYPTION=ON -DUSE_ENCLIB=openssl-evp -DUSE_OPENSSL_PC=ON
+          cmake --build srt-src/build -j"$(nproc)"
+          cmake --install srt-src/build
+          if ls srt-out/lib/libsrt*.so* >/dev/null 2>&1; then
+              echo "::error::libsrt produced a shared object; it must be static only"
+              exit 1
+          fi
+
       # Headers only -- no NVIDIA library is linked or shipped. FFmpeg resolves the CUDA/NVDEC
       # entry points by dlopen at runtime, so a machine with no NVIDIA driver simply reports no
       # CUDA device and falls back, exactly as it does today with BtbN's kit.
@@ -284,11 +327,11 @@ jobs:
           # but not all dependencies are satisfied: ffnvcodec" -- a message that reads like a flag
           # problem rather than a path one. $PWD is the container's view and is what both
           # prefixes were installed under.
-          pcp="$PWD/dav1d-out/lib/pkgconfig:$PWD/nv-out/lib/pkgconfig:$PWD/openssl-out/lib/pkgconfig"
+          pcp="$PWD/dav1d-out/lib/pkgconfig:$PWD/nv-out/lib/pkgconfig:$PWD/openssl-out/lib/pkgconfig:$PWD/srt-out/lib/pkgconfig"
           echo "PKG_CONFIG_PATH=$pcp" >> "$GITHUB_ENV"
           # Asserted here, where the cause is still obvious, rather than left to configure.
-          PKG_CONFIG_PATH="$pcp" pkg-config --modversion ffnvcodec dav1d openssl || {
-              echo "::error::ffnvcodec, dav1d and/or openssl are not visible to pkg-config under $PWD"
+          PKG_CONFIG_PATH="$pcp" pkg-config --modversion ffnvcodec dav1d openssl srt || {
+              echo "::error::ffnvcodec, dav1d, openssl and/or srt are not visible to pkg-config under $PWD"
               exit 1
           }
 
@@ -335,10 +378,11 @@ jobs:
             --enable-zlib --enable-bzlib \
             --enable-libdav1d \
             --enable-openssl \
+            --enable-libsrt \
             --enable-libxcb --enable-libxcb-shm --enable-libxcb-xfixes --enable-libxcb-shape \
-            --extra-ldflags='-Wl,--exclude-libs,libssl.a:libcrypto.a' \
+            --extra-ldflags='-Wl,--exclude-libs,libssl.a:libcrypto.a:libsrt.a' \
             --pkg-config-flags=--static 2>&1 | tee configure.out
-          # --exclude-libs: OpenSSL's symbols stay local to libavformat. Exported, they would be
+          # --exclude-libs: OpenSSL's and libsrt's symbols stay local to libavformat. Exported, they would be
           # bound through the global scope like any other, so a process that already has the
           # system libssl loaded -- .NET does, for HttpClient -- could have libavformat's TLS
           # calls land in a different OpenSSL with different struct layouts, or the reverse.
@@ -382,7 +426,7 @@ jobs:
               echo "::error::config_components.h is not where this step expects it"
               exit 1
           }
-          for sym in HTTPS_PROTOCOL TLS_PROTOCOL; do
+          for sym in HTTPS_PROTOCOL TLS_PROTOCOL LIBSRT_PROTOCOL; do
               grep -q "^#define CONFIG_$sym 1$" config_components.h || {
                   echo "::error::CONFIG_$sym is not enabled"
                   exit 1
@@ -414,7 +458,7 @@ jobs:
           # there is no -liconv to leak and nothing to disable; libdav1d and the xcb group are the
           # non-system entries, and both are static (the previous step pruned xcb's .so files).
           externals=$(awk '/^External libraries:/ { grab = 1; next } /^External libraries providing/ { grab = 0 } grab && NF { for (i = 1; i <= NF; i++) print $i }' configure.out | sort -u)
-          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(iconv|zlib|bzlib|libdav1d|openssl|ffnvcodec|libxcb|libxcb[_-]shm|libxcb[_-]shape|libxcb[_-]xfixes)$' || true)
+          unexpected=$(printf '%s\n' "$externals" | grep -vE '^(iconv|zlib|bzlib|libdav1d|openssl|libsrt|ffnvcodec|libxcb|libxcb[_-]shm|libxcb[_-]shape|libxcb[_-]xfixes)$' || true)
           if [ -n "$unexpected" ]; then
               echo "::error::configure linked external libraries beyond the expected set, so this kit would only load on a machine that has them:"
               printf '%s\n' "$unexpected"
@@ -426,6 +470,10 @@ jobs:
           }
           printf '%s\n' "$externals" | grep -qx openssl || {
               echo "::error::openssl is not among the linked external libraries, so https will not open"
+              exit 1
+          }
+          printf '%s\n' "$externals" | grep -qx libsrt || {
+              echo "::error::libsrt is not among the linked external libraries, so srt:// will not open"
               exit 1
           }
           printf '%s\n' "$externals" | grep -qE '^libxcb$' || {
@@ -527,14 +575,15 @@ jobs:
               esac
           done
 
-          # The static OpenSSL must not leak into any library's dynamic symbol table; see
+          # The static OpenSSL and libsrt must not leak into any library's dynamic symbol table; see
           # --exclude-libs in the configure step for what an exported copy collides with.
+          # _ZN3srt is libsrt's C++ namespace, mangled.
           for so in "$lib"/*.so.*; do
               [ -L "$so" ] && continue
               exported=$(nm -D --defined-only "$so" | awk '{ print $NF }' \
-                | grep -E '^(SSL|SSL_CTX|OPENSSL|CRYPTO|EVP|X509|BIO|ERR|RAND|PEM|ASN1|BN|OSSL)_' | head -5 || true)
+                | grep -E '^(SSL|SSL_CTX|OPENSSL|CRYPTO|EVP|X509|BIO|ERR|RAND|PEM|ASN1|BN|OSSL|srt)_|^_ZN3srt' | head -5 || true)
               if [ -n "$exported" ]; then
-                  echo "::error::$(basename "$so") exports OpenSSL symbols, e.g.:"
+                  echo "::error::$(basename "$so") exports OpenSSL or libsrt symbols, e.g.:"
                   printf '%s\n' "$exported"
                   fail=1
               fi
@@ -558,11 +607,12 @@ jobs:
       # it. Loads the set by absolute path with nothing preloaded and the most dependent library
       # first, then asks for the four things the consumer needs and that static analysis cannot
       # confirm: that v4l2 and x11grab are registered, that the static dav1d really is inside
-      # libavcodec, and that libavutil can create a VAAPI device type. Creating an actual VAAPI
+      # libavcodec, and that libavutil can create a VAAPI device type; then that srt:// resolves to
+      # the static libsrt and https:// really fetches. Creating an actual VAAPI
       # device, or an x11grab capture, is not possible here -- a hosted runner has no GPU and no
       # X server -- so registration/type lookup is as far as this can honestly go, and the real
       # hardware/display check happens in StreamDock's own suites.
-      - name: load the kit and confirm v4l2, x11grab, libdav1d and the VAAPI device type
+      - name: load the kit and confirm v4l2, x11grab, libdav1d, the VAAPI device type, srt and https
         run: |
           cat > probe.c <<'EOF'
           // RTLD_DEFAULT is a GNU extension and glibc's dlfcn.h hides it without this, so the
@@ -618,6 +668,14 @@ jobs:
               int (*closep)(void **) = dlsym(RTLD_DEFAULT, "avio_closep");
               if (!net_init || !open2 || !rd || !closep) { fprintf(stderr, "dlsym avio failed\n"); return 2; }
               net_init();
+              // srt:// resolves to libavformat's libsrt protocol, which it does only when the static
+              // libsrt is inside it: there is no built-in srt protocol to fall back to. Opening one
+              // needs a peer, which a hosted runner does not have.
+              const char *(*proto)(const char *) = dlsym(RTLD_DEFAULT, "avio_find_protocol_name");
+              if (!proto) { fprintf(stderr, "dlsym avio_find_protocol_name failed\n"); return 2; }
+              const char *srt = proto("srt://127.0.0.1:9000?mode=caller");
+              if (!srt || strcmp(srt, "libsrt")) { fprintf(stderr, "srt:// resolves to %s, not libsrt\n", srt ? srt : "nothing"); return 8; }
+              printf("srt:// resolves to libsrt\n");
               // Several hosts, passing on the first that answers: one site timing out from a
               // runner (ffmpeg.org did, 2026-11-08) is the network, not the kit.
               for (int i = 3; i < argc; i++) {
@@ -651,6 +709,7 @@ jobs:
           cp src/COPYING.LGPLv2.1 "$name/"
           cp dav1d-src/COPYING "$name/COPYING.dav1d"
           cp openssl-src/LICENSE.txt "$name/COPYING.openssl"
+          cp srt-src/LICENSE "$name/COPYING.srt"
           tar -cJf "$name.tar.xz" "$name"
           sha256sum "$name.tar.xz" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "KIT=$name.tar.xz" >> "$GITHUB_ENV"
