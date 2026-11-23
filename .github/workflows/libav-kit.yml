@@ -481,12 +481,13 @@ jobs:
               net_init();
               // srt:// resolves to libavformat's libsrt protocol, which it does only when the static
               // libsrt is inside it: there is no built-in srt protocol to fall back to. Opening one
-              // needs a peer, which a hosted runner does not have.
+              // needs a peer, which a hosted runner does not have. libsrt registers as "srt" (its
+              // URLProtocol name), so that is the answer; without libsrt there is none.
               const char *(*proto)(const char *) = dlsym(RTLD_DEFAULT, "avio_find_protocol_name");
               if (!proto) { fprintf(stderr, "dlsym avio_find_protocol_name failed\n"); return 2; }
               const char *srt = proto("srt://127.0.0.1:9000?mode=caller");
-              if (!srt || strcmp(srt, "libsrt")) { fprintf(stderr, "srt:// resolves to %s, not libsrt\n", srt ? srt : "nothing"); return 8; }
-              printf("srt:// resolves to libsrt\n");
+              if (!srt || strcmp(srt, "srt")) { fprintf(stderr, "srt:// resolves to %s, not the libsrt protocol\n", srt ? srt : "nothing"); return 8; }
+              printf("srt:// resolves to the libsrt protocol\n");
               // Several hosts, passing on the first that answers: one site timing out from a
               // runner (ffmpeg.org did, 2026-11-08) is the network, not the kit.
               for (int i = 3; i < argc; i++) {
