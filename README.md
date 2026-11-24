@@ -684,7 +684,7 @@ on macOS. Always available on macOS, nothing to install:
 * `theora`: Free lossy video compression format
 * `opus`: Lossy audio coding format
 * `opencore-amr`: AMR-NB and AMR-WB speech codecs
-* `srt`: Secure Reliable Transport
+* `srt`: Secure Reliable Transport (needs `--tls=openssl`, the default only with `--enable-gpl-and-non-free`)
 * `webp`: Image format both lossless and lossy
 * `libjxl`: JPEG XL image format
 * `lcms2`: ICC profile support in the image decoders and the `iccdetect` and `iccgen` filters

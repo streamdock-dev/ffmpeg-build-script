@@ -265,9 +265,7 @@ echo "TLS backend: $TLS_BACKEND"
 # build log an hour later, where their own guards report it.
 if [ "$TLS_BACKEND" = "gnutls" ]; then
     echo "Note: libssh (sftp://) will be skipped - it needs OpenSSL."
-    if $NONFREE_AND_GPL; then
-        echo "Note: libsrt will be skipped - its encryption layer needs OpenSSL."
-    fi
+    echo "Note: libsrt (srt://) will be skipped - its encryption layer needs OpenSSL."
 fi
 
 if [ -n "$WHISPER_BACKEND" ]; then

@@ -5,7 +5,7 @@ name: macOS CLI kit (republish)
 # a new tag: StreamDock pins the tag plus the file name, so its pin does not move. The build and
 # checks are build-macos's; the AV1 encode check is added here because libaom built without run-time
 # CPU detection SIGILLed on Apple Silicon (it ran SVE code no Apple CPU has) and every other
-# check passed it.
+# check passed it. --tls=openssl is what gives this LGPL kit libsrt (see build_srt).
 
 on:
   workflow_dispatch:
@@ -65,7 +65,7 @@ jobs:
         if: steps.wanted.outputs.run == 'true'
         run: |
           while sleep 300; do echo "=====[ $SECONDS seconds still running ]====="; done &
-          SKIPINSTALL=yes VERBOSE=yes ./build-ffmpeg --build
+          SKIPINSTALL=yes VERBOSE=yes ./build-ffmpeg --build --tls=openssl
           kill %1
 
       # See build-macos in build.yml: anything outside /System or /usr/lib will not exist on an
@@ -97,6 +97,31 @@ jobs:
               exit 1
             }
           done
+
+      # StreamDock streams to custom SRT destinations through this binary, and ffmpeg's
+      # configure drops libsrt silently when it is missing, so push a real SRT stream to a
+      # local listener rather than trusting the build's exit code.
+      - name: stream over SRT
+        if: steps.wanted.outputs.run == 'true'
+        run: |
+          ./workspace/bin/ffmpeg -hide_banner -protocols 2>/dev/null | sed -n '/^Output:/,$p' | grep -qx '  srt' || {
+            echo "::error::the build has no srt protocol"
+            exit 1
+          }
+          ./workspace/bin/ffmpeg -hide_banner -v error -y -i 'srt://127.0.0.1:9710?mode=listener&timeout=20000000' \
+            -c copy -f mpegts srt-received.ts &
+          listener=$!
+          sleep 2
+          ./workspace/bin/ffmpeg -hide_banner -v error -re -f lavfi -i testsrc2=size=320x240:rate=30 \
+            -frames:v 60 -c:v mpeg2video -f mpegts 'srt://127.0.0.1:9710?mode=caller'
+          wait "$listener" || true
+          frames=$(./workspace/bin/ffprobe -v error -count_frames -select_streams v:0 \
+            -show_entries stream=nb_read_frames -of default=nw=1:nk=1 srt-received.ts | head -1 || true)
+          echo "received $frames frames over SRT"
+          if [ "${frames:-0}" -lt 50 ]; then
+            echo "::error::only ${frames:-0} of 60 frames arrived over SRT"
+            exit 1
+          fi
 
       - name: package
         if: steps.wanted.outputs.run == 'true'

@@ -140,8 +140,10 @@ build_avisynth() {
 # the legacy AES context that nettle 4.0 removed, so cryspr.c dies on an incomplete type.
 # Verified against srt 1.5.6 and nettle 4.0, the two versions pinned here. Building OpenSSL
 # anyway just for SRT would defeat the point of asking for GnuTLS, so SRT is skipped instead.
+#
+# Not licence-gated: libsrt is MPL-2.0, which an LGPL ffmpeg can link, so an LGPL build with
+# --tls=openssl gets srt:// too. StreamDock's macOS CLI kit is one, and streams to SRT.
 build_srt() {
-    if ! $NONFREE_AND_GPL; then return; fi
     if [ "$TLS_BACKEND" != "openssl" ]; then
         echo "Skipping libsrt: its encryption layer needs OpenSSL, and --tls=$TLS_BACKEND was requested."
         return
