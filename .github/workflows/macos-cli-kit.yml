@@ -1,0 +1,121 @@
+name: macOS CLI kit (republish)
+
+# Rebuilds the LGPL ffmpeg/ffprobe that build.yml's build-macos job publishes on a v* tag, and
+# replaces that asset under an existing release. This is how a fix to the CLI kit ships without
+# a new tag: StreamDock pins the tag plus the file name, so its pin does not move. The build and
+# checks are build-macos's; the AV1 encode check is added here because libaom built without run-time
+# CPU detection SIGILLed on Apple Silicon (it ran SVE code no Apple CPU has) and every other
+# check passed it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: existing release tag whose ffmpeg-macos-<arch>-lgpl.tar.xz is replaced
+        required: true
+        default: "v9.0.8-streamdock.1"
+      arch:
+        description: which kit to rebuild
+        required: true
+        default: arm64
+        type: choice
+        options:
+          - arm64
+          - x86_64
+          - both
+      dry_run:
+        description: build and check, but upload nothing (the tarball is kept as a run artifact)
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: build in native macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - name: skip an architecture not asked for
+        id: wanted
+        run: |
+          if [ '${{ inputs.arch }}' = both ] || [ '${{ inputs.arch }}' = '${{ matrix.arch }}' ]; then
+            echo "run=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "run=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout code
+        if: steps.wanted.outputs.run == 'true'
+        uses: actions/checkout@v5
+
+      - name: remove untrusted homebrew taps
+        if: steps.wanted.outputs.run == 'true'
+        run: |
+          brew untap aws/tap || true
+
+      - name: build ffmpeg
+        if: steps.wanted.outputs.run == 'true'
+        run: |
+          while sleep 300; do echo "=====[ $SECONDS seconds still running ]====="; done &
+          SKIPINSTALL=yes VERBOSE=yes ./build-ffmpeg --build
+          kill %1
+
+      # See build-macos in build.yml: anything outside /System or /usr/lib will not exist on an
+      # end-user Mac.
+      - name: verify no host-specific dynamic dependencies leaked in
+        if: steps.wanted.outputs.run == 'true'
+        run: |
+          for bin in ffmpeg ffprobe; do
+            leaked=$(otool -L "./workspace/bin/$bin" | tail -n +2 | awk '{print $1}' | grep -v '^/System/\|^/usr/lib/' || true)
+            if [ -n "$leaked" ]; then
+              echo "::error::$bin links host-specific libraries that won't exist on an end-user Mac:"
+              echo "$leaked"
+              exit 1
+            fi
+          done
+
+      - name: encode AV1 with libaom and SVT-AV1
+        if: steps.wanted.outputs.run == 'true'
+        run: |
+          ./workspace/bin/ffmpeg -buildconf
+          for enc in libaom-av1 libsvtav1; do
+            ./workspace/bin/ffmpeg -hide_banner -v error -f lavfi -i testsrc2=size=320x240:rate=30 \
+              -frames:v 30 -c:v "$enc" -y "av1-$enc.mkv" || {
+              echo "::error::$enc failed to encode (exit $?)"
+              exit 1
+            }
+            ./workspace/bin/ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "av1-$enc.mkv" | grep -qx av1 || {
+              echo "::error::$enc wrote no AV1 stream"
+              exit 1
+            }
+          done
+
+      - name: package
+        if: steps.wanted.outputs.run == 'true'
+        run: |
+          tar -cJf ffmpeg-macos-${{ matrix.arch }}-lgpl.tar.xz -C workspace/bin ffmpeg ffprobe
+
+      - name: keep as a run artifact
+        if: steps.wanted.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-macos-${{ matrix.arch }}-lgpl
+          path: ffmpeg-macos-${{ matrix.arch }}-lgpl.tar.xz
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: upload to the release
+        if: steps.wanted.outputs.run == 'true' && !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload '${{ inputs.release_tag }}' ffmpeg-macos-${{ matrix.arch }}-lgpl.tar.xz --clobber \
+            --repo '${{ github.repository }}'
