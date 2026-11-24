@@ -500,11 +500,13 @@ build_av1() {
         download "https://aomedia.googlesource.com/aom/+archive/refs/tags/v$CURRENT_PACKAGE_VERSION.tar.gz" "av1-$CURRENT_PACKAGE_VERSION.tar.gz" "av1"
         make_dir "$PACKAGES"/aom_build
         cd "$PACKAGES"/aom_build || exit
-        if $MACOS_SILICON; then
-            execute cmake -DENABLE_TESTS=0 -DENABLE_EXAMPLES=0 -DCMAKE_INSTALL_PREFIX="${WORKSPACE}" -DCMAKE_INSTALL_LIBDIR=lib -DCONFIG_RUNTIME_CPU_DETECT=0 "$PACKAGES"/av1
-        else
-            execute cmake -DENABLE_TESTS=0 -DENABLE_EXAMPLES=0 -DCMAKE_INSTALL_PREFIX="${WORKSPACE}" -DCMAKE_INSTALL_LIBDIR=lib "$PACKAGES"/av1
-        fi
+        # Keep libaom's run-time CPU detection on, Apple Silicon included. With
+        # CONFIG_RUNTIME_CPU_DETECT=0, aom_arm_cpu_caps() reports every extension the
+        # compiler could target as present, and Apple clang targets SVE and SVE2, which no
+        # Apple CPU has. The first SVE kernel then dies with SIGILL: libaom-av1 on an M1
+        # crashed in aom_sum_squares_2d_i16_sve on its first frame. With detection on,
+        # aarch64_cpudetect.c asks sysctl, and macOS never reports SVE.
+        execute cmake -DENABLE_TESTS=0 -DENABLE_EXAMPLES=0 -DCMAKE_INSTALL_PREFIX="${WORKSPACE}" -DCMAKE_INSTALL_LIBDIR=lib "$PACKAGES"/av1
         execute make -j "$MJOBS"
         execute make install
 
